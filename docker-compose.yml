@@ -1,0 +1,27 @@
+services:
+  curate:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.cpu
+    command: ["streamlit", "run", "src/dome_triage/curate/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./configs:/app/configs
+      # Read-only access to the sibling repos referenced by absolute paths in configs/sources.yaml
+      - /home/gavinfarrell/PhD_Code:/home/gavinfarrell/PhD_Code:ro
+    working_dir: /app
+
+  pipeline:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.cpu
+    command: ["bash"]
+    volumes:
+      - ./data:/app/data
+      - ./configs:/app/configs
+      - /home/gavinfarrell/PhD_Code:/home/gavinfarrell/PhD_Code:ro
+    working_dir: /app
+    tty: true
+    stdin_open: true

@@ -1,0 +1,23 @@
+# Global pipeline settings shared across CLI steps.
+
+curation:
+  events_log: data/processed/curation_events.csv
+  conflict_resolutions: data/processed/conflict_resolutions.csv
+  backup_suffix: "_backup"
+  default_curator: gavinfarrell
+
+keywords:
+  candidates: data/processed/keyword_lexicon_candidates.csv
+  lexicon: data/processed/keyword_lexicon.csv
+  seed_terms: /home/gavinfarrell/PhD_Code/MLit-Triage-Nextflow/categorized_terms.csv
+
+budget:
+  # Hard cap (GBP) on paid cloud/API spend across the whole project (Phase 4+). Any code path
+  # that calls a paid API or provisions paid cloud/TPU compute must estimate and log cost here
+  # before running, and must not proceed past this cap without explicit confirmation.
+  total_cap_gbp: 100
+  spend_log: data/processed/compute_spend_log.csv
+
+fulltext:
+  link_mode: none   # none | symlink | copy -- see AGENTS.md; default never copies PDFs into the repo
+  local_dir: data/fulltext

@@ -1,0 +1,41 @@
+# Data (all pipeline data is gitignored; see AGENTS.md for provenance/reproduction policy)
+data/
+!data/.gitkeep
+
+# PDFs / large binaries never committed, except the tiny placeholder fixtures the loader tests
+# depend on (tests/fixtures/pdf_directory_gold_sample*/**).
+*.pdf
+*.tar.gz
+!tests/fixtures/**/*.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+
+# NLTK / model caches
+nltk_data/
+.cache/
+
+# Streamlit
+.streamlit/
+
+# Env / secrets
+.env
+*.env.local
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Claude session artifacts
+.claude/
