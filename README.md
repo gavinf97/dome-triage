@@ -28,45 +28,70 @@ This repo consolidates and builds on several earlier, disconnected efforts in th
 None of these talk to each other, and none has ontology mapping or a trained classifier — that's
 what this repo is for. See `ROADMAP.md` for the full phase breakdown and current status.
 
+## Design philosophy: human-led, fully traceable
+
+This pipeline is built to be run **manually, one step at a time, by a person following along** —
+not as a black-box end-to-end automated job. Every command prints what it read, what it's doing
+(with a live progress bar for anything slow), and what it wrote, and every generated file is
+backed by an entry in `data/provenance.jsonl` recording the exact command, inputs, config, and git
+commit that produced it (see `AGENTS.md`). `pipeline run --steps a,b,c` exists as a convenience
+for re-running an already-verified chain quickly — it is not the primary way to use this repo.
+
 ## Quickstart
+
+Each command below is meant to be run on its own, so you can inspect its output before deciding
+on the next one — see `ROADMAP.md`'s "Human-in-the-loop checkpoint map" for exactly what to look
+at and where manual curation happens.
 
 ```bash
 docker compose build
+
+# 1. Consolidate the existing labeled sources
 docker compose run --rm pipeline dome-triage ingest load-sources
 docker compose run --rm pipeline dome-triage dedupe consolidate
 docker compose run --rm pipeline dome-triage fulltext build-manifest
+
+# 2. Build and threshold the keyword lexicon
 docker compose run --rm pipeline dome-triage keywords tfidf
 docker compose run --rm pipeline dome-triage keywords keybert
 docker compose run --rm pipeline dome-triage keywords build-lexicon
+docker compose run --rm pipeline dome-triage keywords lexicon-stats   # pick a cutoff from real counts
+# ... approve terms above that cutoff via the Streamlit "Keyword Review" page ...
 
-# or run the whole chain at once:
-docker compose run --rm pipeline dome-triage pipeline run \
-  --steps ingest,dedupe,manifest,tfidf,keybert,build-lexicon
+# 3. Bulk blunt-match candidate construction (one year at a time -- see ROADMAP.md for scale)
+docker compose run --rm pipeline dome-triage bulk-match fetch --year 2024
+docker compose run --rm pipeline dome-triage bulk-match build-candidates
 
-# human curation UI (http://localhost:8501)
+# 4. Pick a relevance-scoring algorithm empirically, then score and sample
+docker compose run --rm pipeline dome-triage keywords scoring-bakeoff
+docker compose run --rm pipeline dome-triage keywords score-bulk-match --scorer bm25
+docker compose run --rm pipeline dome-triage sampling stratify
+docker compose run --rm pipeline dome-triage ingest fetch-clear-negatives --year-from 2015 --year-to 2025
+
+# 5. Human curation (http://localhost:8501)
 docker compose up curate
-
-# after a curation session, fold decisions back into the canonical dataset:
+# ... after a curation session, fold decisions back into the canonical dataset ...
 docker compose run --rm pipeline dome-triage curate materialize
 ```
 
-Every command reads its four config files from `configs/` by default (override with
-`--config-dir`).
-
-Every step reads/writes plain CSV/Parquet files under `data/` (gitignored) via paths declared in
-`configs/`, so any step can be run, inspected, and re-run independently — see `AGENTS.md` for the
-full step list and the human-in-the-loop checkpoints.
+Every command reads its config files from `configs/` by default (override with `--config-dir`).
+Every step reads/writes plain CSV/JSONL files under `data/` (gitignored) via paths declared in
+`configs/`, so any step can be run, inspected, and re-run independently.
 
 ## Status
 
-**Implemented (this pass):** repo scaffold, Docker, data consolidation across the six sources
-above into one canonical labeled dataset with full provenance and conflict-flagging, a Dockerized
-Streamlit curation app, and a TF-IDF + KeyBERT keyword extraction step with a human review
-checkpoint.
+**Implemented:** repo scaffold, Docker, data consolidation across the existing labeled sources
+into one canonical dataset with full provenance and conflict-flagging, a Dockerized Streamlit
+curation app (with MeSH display, structured feature capture, and a genuine Undeterminable
+outcome), TF-IDF + KeyBERT keyword extraction with a threshold tool and human review checkpoint,
+bulk blunt-match candidate construction against Europe PMC with full metadata capture (including
+MeSH headings), an empirically-validated relevance-scoring bake-off (BM25/TF-IDF-cosine/
+weighted-sum), stratified sampling, a clear-negative sampler, and a project-wide provenance
+ledger.
 
-**Not yet built** (specified in `ROADMAP.md`): EDAM/domain ontology tagging, baseline and
-BERT/LLM classifiers, probability calibration and confidence-based routing, the bulk historical
-Europe PMC scan, and the daily production pipeline.
+**Not yet built** (specified in `ROADMAP.md`): domain-science/EDAM tagging beyond the MeSH
+headings already captured, baseline and BERT/LLM classifiers, probability calibration and
+confidence-based routing, the bulk historical Europe PMC scan, and the daily production pipeline.
 
 ## License
 

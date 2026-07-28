@@ -1,42 +1,148 @@
 # Roadmap
 
-Phase 0-1 (repo scaffold, data consolidation, curation app, keyword extraction) is implemented.
-Phases 2-8 below are specified — interfaces and acceptance criteria are fixed so later work slots
-in without redesigning what's already built — but not implemented yet.
+Phase 0-1 (repo scaffold, data consolidation, curation app, keyword extraction, bulk candidate
+construction, structured curation) is implemented. Phases 2-8 below are specified — interfaces
+and acceptance criteria are fixed so later work slots in without redesigning what's already
+built — but not implemented yet.
+
+## Human-in-the-loop checkpoint map (Phase 1)
+
+Which steps are fully automated, which produce a *candidate* file that isn't trusted until a
+human looks at it, and exactly what gets reviewed where:
+
+| # | Command | Automated output | Human reviews via | Reviewed/approved output |
+|---|---|---|---|---|
+| 1 | `ingest load-sources` → `dedupe consolidate` | `canonical_dataset.csv` | Conflicts page (only flagged conflicts need a fresh look — the rest were already human-labeled in prior curation rounds) | `conflict_resolutions.csv` |
+| 2 | `keywords tfidf`/`keybert`/`build-lexicon` | `keyword_lexicon_candidates.csv` (tens of thousands of candidate terms) | `keywords lexicon-stats` (pick a threshold from real counts) + Keyword Review page (manual approve/reject/edit of the band above that threshold) | `keyword_lexicon.csv` |
+| 3 | `bulk-match fetch --year Y` (repeat per year, human-paced) | per-year raw EPMC query cache | Not reviewed individually — sanity-checked in aggregate (row counts, field completeness) | `bulk-match build-candidates` → `bulk_candidates.csv` |
+| 4 | `keywords scoring-bakeoff` | comparison report (`scoring_bakeoff_report.csv`) | Human reads the report and picks the winning scorer(s) — a real decision point | recorded choice (used as `--scorer`) |
+| 5 | `keywords score-bulk-match --scorer <chosen>` | `bulk_candidates_scored.csv` (`match_score` per record) | Not reviewed directly — this is what the stratified sample is drawn from | — |
+| 6 | `sampling stratify` (human sets `cap_per_stratum` first) | `stratified_candidate_pool.csv` — **this file's size is the number of new papers needing manual review** | **Curate app** (`docker compose up curate`) — one paper at a time: positive / negative / undeterminable / skipped, plus structured feature flags, MeSH shown for context | Folded into `canonical_dataset.csv` via `curate materialize` |
+| 7 | `ingest fetch-clear-negatives` | `clear_negative_candidates.csv` | Same Curate app queue, tagged as clear-negative candidates | Same as #6 |
+
+Everything from Phase 3 onward follows the same pattern: automated step produces a report or
+artifact, human reviews it at a named decision point (picking the winning model from a bake-off
+report, setting calibration thresholds from a reliability diagram, spot-checking a precision
+sample from the full scan) before the next step proceeds — nothing auto-promotes silently.
+
+## Curation workload estimate
+
+Steps #6 and #7 above are where the real manual labor lives, and its size is directly controlled
+by config, not fixed by the code:
+
+- Strata: ~4 match-score bands × ~16 journal buckets (top 15 + "other") × ~5 year buckets
+  (5-year bins) ≈ **320 stratum combinations** (`configs/sampling.yaml`).
+- `cap_per_stratum` is the single knob: cap=5 → up to ~1,600 candidates queued; cap=10 → up to
+  ~3,200; cap=20 → up to ~6,400 (actual totals typically land somewhat below the theoretical max).
+- Suggested starting point for a first pass: **cap=10 (≈3,000-3,200 candidates from the
+  AI/ML-matched pool) + a matched ≈1,500-2,000 clear-negative sample** — roughly **4,500-5,000
+  new papers**. At a realistic 20-40 seconds per quick title/abstract/MeSH decision in the app,
+  that's very roughly 25-55 hours of curation, doable across many sessions (the app resumes
+  exactly where it left off).
+- Not a commitment — `cap_per_stratum` is the one number to change for a second pass.
 
 ## Phase 0 — Repo scaffold ✅
 
 Docker, README, AGENTS.md, CC BY 4.0 license, GitHub remote, CLI skeleton, config system.
 
-## Phase 1 — Data consolidation, curation app, keyword extraction ✅
+## Phase 1 — Data consolidation, curation, keyword extraction & bulk candidate construction ✅
 
 - Consolidates the 7 existing labeled-data sources (across `DOME_Top_Curate`,
   `DOME-Copilot-Data-Analysis`, `EBI_Search_DOME`) into one canonical dataset with full
   provenance and conflict-flagging (`src/dome_triage/dedupe/`).
 - Dockerized Streamlit curation app porting the proven YES/NO/Skip/resume/backup pattern from
-  `DOME_Top_Curate/curation.ipynb`, extended with Uncertain/Close-Negative tags, free-text notes,
-  and a conflict-resolution page (`src/dome_triage/curate/`).
+  `DOME_Top_Curate/curation.ipynb`, extended with a genuine fourth **Undeterminable** decision
+  (see "Undeterminable handling policy" below), MeSH headings shown for context, a
+  config-driven structured feature checklist (`configs/curation_features.yaml` — a living
+  checklist, not a fixed schema), and a conflict-resolution page (`src/dome_triage/curate/`).
 - TF-IDF + KeyBERT keyword extraction producing a scored keyword lexicon, seeded from
-  `MLit-Triage-Nextflow/categorized_terms.csv`, with a human review checkpoint
-  (`src/dome_triage/keywords/`).
+  `MLit-Triage-Nextflow/categorized_terms.csv`, with a `lexicon-stats` threshold tool and a
+  human review checkpoint (`src/dome_triage/keywords/`).
+- **Bulk blunt-match candidate construction** (`src/dome_triage/ingest/bulk_match.py`): queries
+  all of Europe PMC for `"artificial intelligence"` OR `"machine learning"` one year at a time
+  (`resultType=core`), capturing full metadata (title/abstract/authors/journal/year/DOI/PMID/
+  PMCID/MeSH headings/pub types/open-access/author keywords) in one pass, no separate enrichment.
+- **Relevance-matching bake-off** (`src/dome_triage/keywords/scoring.py`,
+  `scoring_bakeoff.py`): three scorers (weighted-sum, BM25, TF-IDF cosine) empirically compared
+  against the already-known-labeled records before any is trusted on the unlabeled bulk pool —
+  live-verified result: BM25 and TF-IDF-cosine (AUROC ≈0.76-0.77) both substantially outperform
+  naive weighted-sum (AUROC ≈0.67), a genuine empirical finding, not an assumption.
+- **Stratified sampling** (`src/dome_triage/sampling/`): match-score band × journal bucket ×
+  year bucket, capped per stratum, feeding the curation queue with a diverse, sized-to-fit set
+  rather than a raw score-cutoff dump.
+- **Clear-negative sampler** (`src/dome_triage/ingest/clear_negative_sampler.py`): random
+  narrow date-window sampling excluding AI/ML terms, since the bulk-match query structurally
+  cannot produce a true "no AI/ML mention at all" negative.
+- **Provenance ledger** (`src/dome_triage/provenance.py`): every step appends a record to
+  `data/provenance.jsonl` (git commit, exact inputs/outputs with row counts and hashes, params,
+  duration) and prints the same as a human-readable summary — no generated file exists without
+  an audit trail of what produced it.
 
-## Phase 2 — Ontology / domain-science tagging
+## Undeterminable handling policy
 
-**Purpose:** map each record to EDAM concepts (topic/operation/data-type) and a coarse
-domain-science label (e.g. genomics vs. environmental science vs. clinical), so the registry can
-be filtered by application domain later.
+The curation app's fourth decision option, "Undeterminable," means a curator looked carefully
+(including at any available full text) and genuinely could not decide — distinct from `skipped`
+(deferred without fully assessing).
+
+1. **No forced resolution at labeling time.** An honest "undeterminable" beats a coin-flip
+   pos/neg — forcing a decision on genuinely ambiguous cases injects label noise.
+2. **One cost-bounded second pass, only for a prioritized subset**: for undeterminable records
+   without full text fetched yet, pull it (`dome-triage fulltext fetch`) and give the curator
+   one more look — but only for records plausibly high-value to get right (recent, relevant
+   journal, high citation count). A residual genuinely-irresolvable fraction is expected and normal.
+3. **Excluded from the classifier's train/val/test splits** (see Model Evaluation Standards
+   below) — they'd only add label noise to a binary classifier.
+4. **Retained as a dedicated calibration/routing validation set.** Once Phase 6's confidence
+   router exists, this human-labeled "genuinely hard" set is the natural benchmark for checking
+   whether the router correctly flags these as "needs human review" rather than confidently
+   guessing wrong — a direct, methodologically clean link between curation output and model
+   validation.
+
+## Model Evaluation Standards
+
+Grounded in DOME's own schema criteria (`dome-skill/references/field_extraction_guide.md` — the
+real DOME schema v2.0.0 field-by-field guide), not generic ML advice. dome-triage self-applies
+the DOME standard to its own model development, since it exists to check that other papers meet
+it. Every future classifier phase (baseline, Bioformer, LLM) must meet these:
+
+- **Splits (DOME D3/D4)**: `data/processed/dataset_splits.csv` (record_id → train/val/test)
+  decided once, early, stratified by label × journal_bucket × year_bucket × match_score_band,
+  e.g. 70/15/15, built only from records with a definitive `positive`/`negative` label. The test
+  split is sealed — never touched for tuning. `undeterminable` records are excluded from all
+  three splits (see policy above) and held out as a separate calibration/routing validation set.
+- **Leakage checks (D3)**: beyond dedup-by-`canonical_key`, an explicit check for cross-split
+  near-duplicates (e.g. a preprint and its later published version), with anything found routed
+  to a review file rather than silently dropped.
+- **Per-model reporting (O1-O8, M1-M4)**: a `model_card.json` per trained model recording
+  algorithm + final hyperparameters, features/encoding, regularization + overfitting/underfitting
+  evidence (train-vs-val curves), parameter count, compute duration/hardware (feeding
+  `compute_spend_log.csv`), output type, and an interpretability characterization.
+- **Per-evaluation reporting (E1-E5)**: metrics reported, the exact protocol (fixed held-out
+  split, stated explicitly), comparison against *both* a naive majority-class baseline *and* the
+  previous simpler model, and statistical confidence (bootstrap CI on the test set; McNemar's
+  test between model variants where applicable).
+- **Input-condition consistency**: every model is trained/evaluated primarily on
+  title+abstract+journal+year+metadata — the same input it will actually receive for the vast
+  majority of the 40M-record full-scan target (Phase 7) — not skewed toward the subset of
+  records that happen to have full text. Full text is used only where the uncertain-tier
+  re-evaluation design calls for it.
+
+## Phase 2 — Domain-science / EDAM tagging (MeSH already captured)
+
+**Purpose:** MeSH headings are already captured directly from Europe PMC metadata at ingest time
+(Phase 1's `bulk_match.py` + `ontology/mesh.py`) — no inference needed for that layer. This
+phase adds a coarse domain-science label (e.g. genomics vs. environmental science vs. clinical)
+and optional EDAM concept mapping (topic/operation/data-type) on top of the MeSH headings
+already present, so the registry can be filtered by application domain later.
 
 **Compute tier:** laptop CPU (embedding similarity against a small ontology is cheap).
 
 **Interface:** `src/dome_triage/ontology/edam_mapper.py::map_to_edam(text: str) ->
 list[EdamMatch]` where `EdamMatch = {concept_id, label, score}`. A parallel
-`domain_mapper.py::map_to_domain(record) -> list[DomainMatch]`.
-
-**Design note:** prefer existing metadata the record already carries (Europe PMC / MeSH major
-topic headings, where present) over inferring tags from scratch — only fall back to
-embedding-similarity-against-EDAM-definitions when no usable existing tag exists. All
-model-suggested tags are proposals for human confirmation via a curation-app page, not
-auto-applied.
+`domain_mapper.py::map_to_domain(record) -> list[DomainMatch]`, preferring the MeSH headings
+already on the record over inferring tags from scratch — only fall back to
+embedding-similarity-against-EDAM-definitions when no usable MeSH tag exists. All model-suggested
+tags are proposals for human confirmation via a curation-app page, not auto-applied.
 
 **Acceptance criteria:** ≥80% of known positives receive at least one EDAM tag above threshold;
 face-validity review on a sample of 50 tagged records.
@@ -56,8 +162,8 @@ class Classifier(Protocol):
 ```
 `src/dome_triage/models/tfidf_logreg.py` is the first implementation.
 
-**Acceptance criteria:** stratified k-fold CV report (precision/recall/F1) on the canonical
-dataset, held as the baseline other models are compared against.
+**Acceptance criteria:** per Model Evaluation Standards above — reported against the fixed held-out
+split, compared to a naive majority-class baseline, with the required O/M/E fields documented.
 
 ## Phase 4 — Bioformer / PubMedBERT fine-tune
 
@@ -71,13 +177,16 @@ the project's £100 total cap.
 
 **Interface:** `src/dome_triage/models/bioformer.py`, same `Classifier` protocol as Phase 3.
 
-**Acceptance criteria:** beats the Phase 3 baseline F1 on the same held-out fold.
+**Acceptance criteria:** per Model Evaluation Standards — beats the Phase 3 baseline on the same
+sealed test split, with full O/M/E reporting.
 
 ## Phase 5 — LLM bake-off
 
-**Purpose:** empirically compare several LLM backends (not commit to one upfront) on a shared
-held-out evaluation sample, to decide whether an LLM is worth using at all versus Bioformer alone,
-and if so which one, for the "uncertain confidence" tier of the routing logic in Phase 6.
+**Purpose:** empirically compare several LLM backends (not commit to one upfront) — trialling
+lightweight LLMs that could scale to the full Europe PMC database using title/abstract/journal/
+year/metadata as input — on a shared held-out evaluation sample, to decide whether an LLM is
+worth using at all versus Bioformer alone, and if so which one, for the "uncertain confidence"
+tier of the routing logic in Phase 6.
 
 **Compute tier:** local Ollama on the lab GPU + one or two cost-efficient cloud APIs, capped by
 the project's overall £100 spend limit, cost logged before each paid batch.
@@ -87,8 +196,8 @@ class per backend (e.g. `OllamaBackend`, `CloudAPIBackend`), plus a `bakeoff.py`
 every registered backend over the same sample and reports precision/recall/F1, cost-per-1,000
 papers, and median latency per backend.
 
-**Acceptance criteria:** a written comparison report and a recommendation for the production
-routing engine.
+**Acceptance criteria:** per Model Evaluation Standards, plus a written comparison report and a
+recommendation for the production routing engine.
 
 ## Phase 6 — Calibration + routing
 
@@ -103,12 +212,14 @@ thresholds) -> {"auto_positive", "auto_negative", "needs_review"}`.
 
 **Acceptance criteria:** a documented reliability diagram; thresholds tuned so
 `auto_positive`/`auto_negative` hit a target precision (e.g. ≥95%); `needs_review` items land in
-the curation app's queue that Phase 1 already built.
+the curation app's queue that Phase 1 already built; validated against the retained
+Undeterminable set (does the router correctly flag genuinely hard cases as needing review?).
 
 ## Phase 7 — Bulk historical Europe PMC scan
 
-**Purpose:** score the full historical Europe PMC corpus (title/abstract/year/metadata; full-text
-fallback only for the routed "uncertain" subset) using the production model chosen after Phase 6.
+**Purpose:** score the **full** Europe PMC database (not just the AI/ML-prefiltered subset used
+to build the training set) using title/abstract/year/metadata (full-text fallback only for the
+routed "uncertain" subset) with whichever model wins Phase 4/5.
 
 **Compute tier:** laptop CPU if the production model is non-LLM (ONNX-quantized Bioformer scales
 to tens of abstracts/sec on CPU); lab GPU or self-hosted Ollama strongly preferred over a paid API

@@ -9,6 +9,7 @@ rolling backup-before-write (`backup_file`) also mirrors that notebook's `backup
 
 from __future__ import annotations
 
+import json
 import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -17,7 +18,7 @@ from typing import Optional
 
 import pandas as pd
 
-EVENT_COLUMNS = ["record_id", "decision", "tag", "notes", "curator", "timestamp"]
+EVENT_COLUMNS = ["record_id", "decision", "tag", "notes", "features", "curator", "timestamp"]
 
 
 def backup_file(path: Path) -> None:
@@ -68,9 +69,17 @@ class CurationSession:
         matches = self.dataset.loc[self.dataset["record_id"] == record_id]
         return matches.iloc[0] if not matches.empty else None
 
-    def record_decision(self, decision: str, tag: Optional[str] = None, notes: str = "") -> None:
+    def record_decision(
+        self,
+        decision: str,
+        tag: Optional[str] = None,
+        notes: str = "",
+        features: Optional[dict] = None,
+    ) -> None:
         """Appends one row to the event log (backup-before-write) and advances the queue.
-        `decision` should be one of "positive"/"negative"/"skipped"."""
+        `decision` should be one of "positive"/"negative"/"undeterminable"/"skipped". `features`
+        holds the structured curation-feature flags (configs/curation_features.yaml) as a dict,
+        stored as JSON -- a living, extensible checklist, not a fixed schema."""
         record = self.current_record()
         if record is None:
             return
@@ -80,6 +89,7 @@ class CurationSession:
             "decision": decision,
             "tag": tag or "",
             "notes": notes,
+            "features": json.dumps(features) if features else "",
             "curator": self.curator,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
@@ -120,14 +130,16 @@ def materialize_events(dataset_path: Path, events_path: Path, output_path: Path)
         contradicts_trusted_prior = (
             prior_confidence in ("human_curated", "registry_confirmed")
             and prior_label in ("positive", "negative")
-            and new_label in ("positive", "negative")
+            and new_label in ("positive", "negative", "undeterminable")
             and new_label != prior_label
         )
 
         dataset.loc[mask, "label"] = "conflict" if contradicts_trusted_prior else new_label
-        dataset.loc[mask, "has_conflict"] = contradicts_trusted_prior
+        dataset.loc[mask, "has_conflict"] = str(contradicts_trusted_prior)
         dataset.loc[mask, "curation_tag"] = event.get("tag") or None
         dataset.loc[mask, "notes"] = event.get("notes") or None
+        if event.get("features"):
+            dataset.loc[mask, "curation_features"] = event["features"]
         dataset.loc[mask, "updated_at"] = datetime.now(timezone.utc).isoformat()
 
     output_path = Path(output_path)

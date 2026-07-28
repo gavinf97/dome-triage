@@ -1,7 +1,6 @@
 """KeyBERT semantic keyword extraction. Config: configs/keybert.yaml. all-MiniLM-L6-v2 is small
-(~90MB) and CPU-feasible per its published spec -- not yet live-verified in this environment
-(no packages installed here); the first task after the Docker image builds should be a smoke
-test (see docker/README.md).
+(~90MB) and CPU-feasible -- live-verified against the full ~1,650-document positive corpus (see
+docker/README.md for the smoke-test note this superseded).
 """
 
 from __future__ import annotations
@@ -10,6 +9,7 @@ from collections import Counter
 
 import pandas as pd
 from keybert import KeyBERT
+from tqdm import tqdm
 
 from dome_triage.keywords.preprocess import strip_html_tags
 
@@ -24,7 +24,7 @@ def extract_keybert_terms(documents: list[str], config: dict) -> pd.DataFrame:
     doc_frequency: Counter[str] = Counter()
     score_sum: dict[str, float] = {}
 
-    for doc in documents:
+    for doc in tqdm(documents, desc="KeyBERT extraction", unit="doc"):
         cleaned = strip_html_tags(doc)
         if not cleaned.strip():
             continue

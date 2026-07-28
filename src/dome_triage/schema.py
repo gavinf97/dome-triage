@@ -10,8 +10,8 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict
 
-Label = Literal["positive", "negative", "skipped", "conflict", "unlabeled"]
-LabelConfidence = Literal["human_curated", "registry_confirmed", "heuristic_candidate"]
+Label = Literal["positive", "negative", "undeterminable", "skipped", "conflict", "unlabeled"]
+LabelConfidence = Literal["human_curated", "registry_confirmed", "heuristic_candidate", "unscored"]
 CurationTag = Literal["uncertain", "close_negative"]
 
 
@@ -51,11 +51,22 @@ class CanonicalRecord(BaseModel):
 
     match_metadata: Optional[dict] = None
 
+    # Populated from Europe PMC's `core` result type by ingest/bulk_match.py -- optional because
+    # older sources (Adapters A-D) predate this capture and MeSH is not guaranteed on every
+    # record even when present (see ontology/mesh.py).
+    mesh_headings: list[str] = []
+    pub_types: list[str] = []
+    is_open_access: Optional[bool] = None
+    keywords_author: list[str] = []
+
     fulltext_available: bool = False
     fulltext_manifest_ref: Optional[str] = None
 
     curation_tag: Optional[CurationTag] = None
     notes: Optional[str] = None
+    # Config-driven structured feature flags captured during curation (configs/curation_features.yaml)
+    # -- an extensible checklist, not a fixed schema; see curate/state.py::CurationSession.record_decision.
+    curation_features: Optional[dict] = None
 
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
@@ -81,5 +92,11 @@ class RawRecord(BaseModel):
     citation_count: Optional[int] = None
 
     match_metadata: Optional[dict] = None
+
+    mesh_headings: list[str] = []
+    pub_types: list[str] = []
+    is_open_access: Optional[bool] = None
+    keywords_author: list[str] = []
+
     fulltext_available: bool = False
     fulltext_source_root: Optional[str] = None

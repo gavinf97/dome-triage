@@ -223,12 +223,16 @@ def load_all_sources(sources_cfg: dict) -> LoaderResult:
 # --- RawRecord <-> DataFrame round-tripping (data/interim/raw_records*.csv) --------------------
 
 
+_RAW_RECORD_JSON_FIELDS = ("match_metadata", "mesh_headings", "pub_types", "keywords_author")
+
+
 def raw_records_to_dataframe(records: list[RawRecord]) -> pd.DataFrame:
     rows = []
     for record in records:
         row = record.model_dump()
-        if row.get("match_metadata"):
-            row["match_metadata"] = json.dumps(row["match_metadata"])
+        for field in _RAW_RECORD_JSON_FIELDS:
+            if row.get(field):
+                row[field] = json.dumps(row[field])
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -237,11 +241,12 @@ def dataframe_to_raw_records(df: pd.DataFrame) -> list[RawRecord]:
     records = []
     for _, row in df.iterrows():
         data = row.to_dict()
-        if isinstance(data.get("match_metadata"), str) and data["match_metadata"]:
-            try:
-                data["match_metadata"] = json.loads(data["match_metadata"])
-            except json.JSONDecodeError:
-                data["match_metadata"] = None
+        for field in _RAW_RECORD_JSON_FIELDS:
+            if isinstance(data.get(field), str) and data[field]:
+                try:
+                    data[field] = json.loads(data[field])
+                except json.JSONDecodeError:
+                    data[field] = None
         for key, value in list(data.items()):
             if isinstance(value, float) and pd.isna(value):
                 data[key] = None
@@ -249,5 +254,7 @@ def dataframe_to_raw_records(df: pd.DataFrame) -> list[RawRecord]:
                 data[key] = None
         if isinstance(data.get("fulltext_available"), str):
             data["fulltext_available"] = data["fulltext_available"].lower() == "true"
+        if isinstance(data.get("is_open_access"), str):
+            data["is_open_access"] = data["is_open_access"].lower() == "true"
         records.append(RawRecord(**data))
     return records

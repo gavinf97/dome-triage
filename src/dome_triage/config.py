@@ -36,15 +36,21 @@ class PipelineConfig:
         pipeline_path: str | Path = "configs/pipeline.yaml",
         tfidf_path: str | Path = "configs/tfidf.yaml",
         keybert_path: str | Path = "configs/keybert.yaml",
+        sampling_path: str | Path = "configs/sampling.yaml",
     ) -> None:
         self.sources = load_yaml(sources_path)
         self.pipeline = load_yaml(pipeline_path)
         self.tfidf = load_yaml(tfidf_path)
         self.keybert = load_yaml(keybert_path)
+        self.sampling = load_yaml(sampling_path)
 
     def path(self, key: str) -> Path:
         """Resolve one of sources.yaml's top-level `paths:` entries, e.g. path("canonical_dataset")."""
         return resolve_path(self.sources["paths"][key])
+
+    def sampling_path(self, key: str) -> Path:
+        """Resolve one of sampling.yaml's top-level `paths:` entries, e.g. sampling_path("bulk_candidates")."""
+        return resolve_path(self.sampling["paths"][key])
 
     def ensure_dirs(self) -> None:
         self.path("interim_dir").mkdir(parents=True, exist_ok=True)

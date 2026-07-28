@@ -1,0 +1,19 @@
+# Stratified sampling config for `dome-triage sampling stratify`. See ROADMAP.md's "Curation
+# workload estimate" for the worked-example arithmetic this feeds -- cap_per_stratum is the one
+# number to change if a first pass turns out too big or too small.
+
+strata:
+  n_score_bands: 4
+  top_n_journals: 15
+  year_bucket_width: 5
+
+sampling:
+  cap_per_stratum: 10
+  random_state: 42
+
+paths:
+  bulk_candidates: data/interim/bulk_candidates.csv
+  bulk_candidates_scored: data/interim/bulk_candidates_scored.csv
+  stratified_candidate_pool: data/processed/stratified_candidate_pool.csv
+  stratum_report: data/processed/stratum_report.csv
+  clear_negative_candidates: data/interim/clear_negative_candidates.csv

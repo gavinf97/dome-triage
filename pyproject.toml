@@ -18,6 +18,8 @@ dependencies = [
     "streamlit>=1.30",
     "sentence-transformers>=2.5",
     "keybert>=0.8",
+    "rank-bm25>=0.2",
+    "tqdm>=4.66",
 ]
 
 [project.optional-dependencies]

@@ -21,7 +21,9 @@ app = typer.Typer(help="dome-triage: literature triage pipeline for the DOME reg
 ingest_app = typer.Typer(help="Load and enrich records from the configured label sources.")
 dedupe_app = typer.Typer(help="Cluster and consolidate raw records into the canonical dataset.")
 fulltext_app = typer.Typer(help="Build/query the full-text availability manifest.")
-keywords_app = typer.Typer(help="TF-IDF + KeyBERT keyword extraction and lexicon building.")
+keywords_app = typer.Typer(help="TF-IDF + KeyBERT keyword extraction, lexicon, and scoring.")
+bulk_match_app = typer.Typer(help="Bulk blunt-match candidate construction against Europe PMC.")
+sampling_app = typer.Typer(help="Stratified sampling over the scored bulk candidate pool.")
 curate_app = typer.Typer(help="Human curation app and event-log materialization.")
 pipeline_app = typer.Typer(help="Run multiple steps in sequence.")
 
@@ -29,10 +31,12 @@ app.add_typer(ingest_app, name="ingest")
 app.add_typer(dedupe_app, name="dedupe")
 app.add_typer(fulltext_app, name="fulltext")
 app.add_typer(keywords_app, name="keywords")
+app.add_typer(bulk_match_app, name="bulk-match")
+app.add_typer(sampling_app, name="sampling")
 app.add_typer(curate_app, name="curate")
 app.add_typer(pipeline_app, name="pipeline")
 
-_CONFIG_DIR_OPTION = typer.Option("configs", "--config-dir", help="Directory containing the 4 config YAMLs.")
+_CONFIG_DIR_OPTION = typer.Option("configs", "--config-dir", help="Directory containing the config YAMLs.")
 
 
 def _load_config(config_dir: str) -> PipelineConfig:
@@ -42,6 +46,7 @@ def _load_config(config_dir: str) -> PipelineConfig:
         pipeline_path=base / "pipeline.yaml",
         tfidf_path=base / "tfidf.yaml",
         keybert_path=base / "keybert.yaml",
+        sampling_path=base / "sampling.yaml",
     )
 
 
@@ -94,6 +99,69 @@ def keywords_build_lexicon(config_dir: str = _CONFIG_DIR_OPTION) -> None:
     pipeline_steps.step_keywords_build_lexicon(_load_config(config_dir))
 
 
+@keywords_app.command("lexicon-stats")
+def keywords_lexicon_stats(config_dir: str = _CONFIG_DIR_OPTION) -> None:
+    """Term-counts remaining at a range of thresholds -- pick a defensible cutoff from real
+    numbers instead of reviewing all ~40k candidates by hand."""
+    pipeline_steps.step_keywords_lexicon_stats(_load_config(config_dir))
+
+
+@keywords_app.command("scoring-bakeoff")
+def keywords_scoring_bakeoff(config_dir: str = _CONFIG_DIR_OPTION) -> None:
+    """Validates every relevance-scoring algorithm against the already-known-labeled records
+    before trusting any of them to rank the unlabeled bulk pool."""
+    pipeline_steps.step_keywords_scoring_bakeoff(_load_config(config_dir))
+
+
+@keywords_app.command("score-bulk-match")
+def keywords_score_bulk_match(
+    scorer: str = typer.Option(
+        "weighted-sum", "--scorer", help='One of "weighted-sum", "bm25", "tfidf-cosine", or "all".'
+    ),
+    config_dir: str = _CONFIG_DIR_OPTION,
+) -> None:
+    pipeline_steps.step_keywords_score_bulk_match(_load_config(config_dir), scorer)
+
+
+@bulk_match_app.command("fetch")
+def bulk_match_fetch(
+    year: int = typer.Option(..., "--year", help="Fetch one year at a time, e.g. --year 2024."),
+    config_dir: str = _CONFIG_DIR_OPTION,
+) -> None:
+    """Fetches every AI/ML-matching Europe PMC record for one year (resultType=core, full
+    metadata incl. MeSH). Deliberately one year per invocation -- inspect the result before
+    deciding whether to fetch another year."""
+    pipeline_steps.step_bulk_match_fetch(_load_config(config_dir), year)
+
+
+@bulk_match_app.command("build-candidates")
+def bulk_match_build_candidates(config_dir: str = _CONFIG_DIR_OPTION) -> None:
+    """Consolidates every completed year fetched so far into one deduplicated candidate pool."""
+    pipeline_steps.step_bulk_match_build_candidates(_load_config(config_dir))
+
+
+@sampling_app.command("stratify")
+def sampling_stratify(config_dir: str = _CONFIG_DIR_OPTION) -> None:
+    """Stratified sample (match-score band x journal x year, capped per stratum in
+    configs/sampling.yaml) over the scored bulk pool -- merges new candidates into
+    canonical_dataset.csv for the curation app's queue."""
+    pipeline_steps.step_sampling_stratify(_load_config(config_dir))
+
+
+@ingest_app.command("fetch-clear-negatives")
+def ingest_fetch_clear_negatives(
+    year_from: int = typer.Option(..., "--year-from"),
+    year_to: int = typer.Option(..., "--year-to"),
+    sample_size: int = typer.Option(2000, "--sample-size"),
+    config_dir: str = _CONFIG_DIR_OPTION,
+) -> None:
+    """Samples genuine AI/ML-free negatives (random narrow date windows) -- merges into
+    canonical_dataset.csv for the curation app's queue, same as sampling stratify."""
+    pipeline_steps.step_ingest_fetch_clear_negatives(
+        _load_config(config_dir), year_from, year_to, sample_size
+    )
+
+
 @curate_app.command("launch")
 def curate_launch(
     port: int = typer.Option(8501, "--port"),
@@ -122,7 +190,14 @@ def curate_materialize(config_dir: str = _CONFIG_DIR_OPTION) -> None:
 @pipeline_app.command("run")
 def pipeline_run(
     steps: str = typer.Option(
-        ..., "--steps", help="Comma-separated step names, e.g. ingest,dedupe,manifest,tfidf,keybert,build-lexicon"
+        ...,
+        "--steps",
+        help=(
+            "Comma-separated step names from: ingest, enrich, dedupe, manifest, tfidf, keybert, "
+            "build-lexicon, lexicon-stats, scoring-bakeoff, bulk-match-build-candidates, "
+            "sampling-stratify. A convenience for re-running an already-verified chain quickly -- "
+            "the manual one-command-at-a-time flow (see README.md) is the primary workflow."
+        ),
     ),
     config_dir: str = _CONFIG_DIR_OPTION,
 ) -> None:

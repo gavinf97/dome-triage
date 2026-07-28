@@ -13,6 +13,7 @@ from typing import Literal, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
+from tqdm import tqdm
 from urllib3.util.retry import Retry
 
 DEFAULT_BASE_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest"
@@ -46,32 +47,46 @@ class EpmcClient:
         self.session = create_session(max_retries, backoff_factor)
 
     def search(
-        self, query: str, result_type: str = "core", page_size: Optional[int] = None
+        self,
+        query: str,
+        result_type: str = "core",
+        page_size: Optional[int] = None,
+        show_progress: bool = False,
     ) -> Iterator[dict]:
-        """Yield every result for `query` via cursorMark deep pagination."""
+        """Yield every result for `query` via cursorMark deep pagination. `show_progress` shows a
+        live tqdm bar against the API's own `hitCount` (known after the first page) -- turn this
+        on for large human-triggered bulk fetches, off for small internal lookups."""
         cursor = "*"
         page_size = page_size or self.page_size
-        while True:
-            params = {
-                "query": query,
-                "pageSize": page_size,
-                "cursorMark": cursor,
-                "format": "json",
-                "resultType": result_type,
-            }
-            resp = self.session.get(f"{self.base_url}/search", params=params, timeout=60)
-            resp.raise_for_status()
-            data = resp.json()
+        pbar = tqdm(total=None, unit="records", desc=query[:40], disable=not show_progress)
+        try:
+            while True:
+                params = {
+                    "query": query,
+                    "pageSize": page_size,
+                    "cursorMark": cursor,
+                    "format": "json",
+                    "resultType": result_type,
+                }
+                resp = self.session.get(f"{self.base_url}/search", params=params, timeout=60)
+                resp.raise_for_status()
+                data = resp.json()
 
-            results = data.get("resultList", {}).get("result", [])
-            if not results:
-                return
-            yield from results
+                if pbar.total is None:
+                    pbar.total = data.get("hitCount", 0)
 
-            next_cursor = data.get("nextCursorMark", "")
-            if not next_cursor or next_cursor == cursor:
-                return
-            cursor = next_cursor
+                results = data.get("resultList", {}).get("result", [])
+                if not results:
+                    return
+                yield from results
+                pbar.update(len(results))
+
+                next_cursor = data.get("nextCursorMark", "")
+                if not next_cursor or next_cursor == cursor:
+                    return
+                cursor = next_cursor
+        finally:
+            pbar.close()
 
     def get_by_ids(
         self, ids: list[str], id_type: Literal["pmcid", "pmid", "doi"]

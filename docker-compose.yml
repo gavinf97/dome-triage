@@ -9,6 +9,8 @@ services:
     volumes:
       - ./data:/app/data
       - ./configs:/app/configs
+      # So provenance.py's git-commit lookup works inside the container too
+      - ./.git:/app/.git:ro
       # Read-only access to the sibling repos referenced by absolute paths in configs/sources.yaml
       - /home/gavinfarrell/PhD_Code:/home/gavinfarrell/PhD_Code:ro
     working_dir: /app
@@ -21,6 +23,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./configs:/app/configs
+      - ./.git:/app/.git:ro
       - /home/gavinfarrell/PhD_Code:/home/gavinfarrell/PhD_Code:ro
     working_dir: /app
     tty: true

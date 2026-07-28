@@ -31,6 +31,14 @@ def _pick_first(values: list[Optional[T]]) -> Optional[T]:
     return next((v for v in values if v is not None), None)
 
 
+def _union_list(values: list[list[str]]) -> list[str]:
+    seen: dict[str, None] = {}
+    for value_list in values:
+        for item in value_list or []:
+            seen.setdefault(item, None)
+    return list(seen)
+
+
 def _merge_cluster(cluster: list[RawRecord], id_priority: tuple[str, ...]) -> CanonicalRecord:
     canonical_key = choose_canonical_key(cluster, id_priority)
     record_id = hashlib.sha1(canonical_key.encode()).hexdigest()
@@ -67,6 +75,10 @@ def _merge_cluster(cluster: list[RawRecord], id_priority: tuple[str, ...]) -> Ca
         source_count=len(cluster),
         has_conflict=(label == "conflict"),
         match_metadata=_pick_first([r.match_metadata for r in cluster]),
+        mesh_headings=_union_list([r.mesh_headings for r in cluster]),
+        pub_types=_union_list([r.pub_types for r in cluster]),
+        is_open_access=_pick_first([r.is_open_access for r in cluster]),
+        keywords_author=_union_list([r.keywords_author for r in cluster]),
         fulltext_available=any(r.fulltext_available for r in cluster),
         created_at=now,
         updated_at=now,
@@ -80,13 +92,23 @@ def consolidate(
     return [_merge_cluster(cluster, id_priority) for cluster in clusters]
 
 
+_LIST_AND_DICT_FIELDS = (
+    "sources",
+    "match_metadata",
+    "mesh_headings",
+    "pub_types",
+    "keywords_author",
+    "curation_features",
+)
+
+
 def to_dataframe(canonical_records: list[CanonicalRecord]) -> pd.DataFrame:
     rows = []
     for rec in canonical_records:
         row = rec.model_dump()
-        row["sources"] = json.dumps(row["sources"])
-        if row.get("match_metadata"):
-            row["match_metadata"] = json.dumps(row["match_metadata"])
+        for field in _LIST_AND_DICT_FIELDS:
+            if row.get(field):
+                row[field] = json.dumps(row[field])
         rows.append(row)
     return pd.DataFrame(rows)
 

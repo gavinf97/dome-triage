@@ -8,7 +8,12 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
+        git \
     && rm -rf /var/lib/apt/lists/*
+
+# The .git bind mount is owned by the host user, not the container's root -- tell git that's
+# fine (read-only, single-purpose container, not a general security concern here).
+RUN git config --global --add safe.directory /app
 
 COPY pyproject.toml README.md LICENSE.md ./
 COPY src/ src/

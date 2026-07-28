@@ -34,19 +34,37 @@ conventions for making changes here.
 - **No premature abstraction.** This is a research pipeline with a small number of real inputs
   (the 7 source files enumerated in `configs/sources.yaml`, which collapse into 4 loader
   adapters). Don't generalize beyond what those actual sources require.
+- **No generated file without a provenance entry.** Every step in `pipeline/steps.py` must call
+  `provenance.finish_step(...)` before returning — it appends one line to `data/provenance.jsonl`
+  (git commit, exact inputs/outputs with row counts and hashes, params, duration) and prints the
+  same as a human-readable summary. If you add a new step, add this call; don't skip it because
+  the step "feels minor."
+- **No new long-running loop without a progress indicator.** Anything that iterates over more
+  than a handful of items with real per-item cost (an API pagination loop, a per-document model
+  call) gets a `tqdm` bar — see `ingest/epmc_client.py`'s `search(..., show_progress=True)` and
+  `keywords/keybert_extract.py` for the pattern. This project is explicitly human-led: the user
+  runs each step manually and needs to see what's happening, not wait on a silent black box.
+- **`configs/curation_features.yaml` is a living checklist, not a fixed schema.** Add or remove
+  structured curation-feature flags freely as it becomes clearer what actually helps model
+  training — don't treat the current set as locked in.
 
 ## Repo layout
 
 ```
 src/dome_triage/
-├── cli.py, config.py, schema.py   # Typer app; YAML config loader; CanonicalRecord model
-├── ingest/                        # EuropePMC/NCBI querying, ID mapping, source loading
+├── cli.py, config.py, schema.py, provenance.py   # Typer app; config loader; CanonicalRecord
+│                                                   model; the provenance ledger (see above)
+├── ingest/                        # EuropePMC/NCBI querying, ID mapping, source loading,
+│                                   # bulk_match.py (bulk AI/ML fetch), clear_negative_sampler.py
 ├── dedupe/                        # union-find clustering, consolidation, conflict detection
 ├── fulltext/                      # PDF manifest + fetch fallback
-├── keywords/                      # TF-IDF + KeyBERT extraction, lexicon building
+├── keywords/                      # TF-IDF + KeyBERT extraction, lexicon building + lexicon-stats,
+│                                   # scoring.py (WeightedSum/BM25/TF-IDF-cosine) + scoring_bakeoff.py
+├── sampling/                      # stratified sampling over the scored bulk candidate pool
+├── ontology/                      # mesh.py (done — MeSH extraction); EDAM/domain mapping is a stub
 ├── curate/                        # Streamlit human curation app
 ├── pipeline/                      # shared step functions + orchestration
-└── ontology/, models/, calibration/, routing/   # STUBS — later phases, see ROADMAP.md
+└── models/, calibration/, routing/   # STUBS — later phases, see ROADMAP.md
 ```
 
 ## Running things
@@ -66,9 +84,15 @@ since those live outside this repo and aren't guaranteed to exist on every machi
 
 ## Data provenance
 
-Every record in `canonical_dataset.csv` carries a `sources` field listing every contributing
-source file, its label, and its confidence tier (`human_curated` / `registry_confirmed` /
-`heuristic_candidate`). When adding a new data source, add a loader in
-`src/dome_triage/ingest/source_loaders.py` (reuse one of the existing 4 adapter shapes if it
-fits) and register it in `configs/sources.yaml` — do not hand-merge new data into
-`canonical_dataset.csv` outside the consolidation pipeline.
+Two complementary mechanisms, both mandatory:
+
+1. **Per-record provenance.** Every record in `canonical_dataset.csv` carries a `sources` field
+   listing every contributing source file, its label, and its confidence tier (`human_curated` /
+   `registry_confirmed` / `heuristic_candidate` / `unscored`). When adding a new data source, add
+   a loader in `src/dome_triage/ingest/source_loaders.py` (reuse one of the existing 4 adapter
+   shapes if it fits) and register it in `configs/sources.yaml` — do not hand-merge new data into
+   `canonical_dataset.csv` outside the consolidation pipeline.
+2. **Per-run provenance.** `data/provenance.jsonl` (see the ground rule above) is the ledger of
+   *how every file was generated* — which command, which inputs, which config, when. The two are
+   complementary: `sources` tells you where a paper's label came from; `provenance.jsonl` tells
+   you how the file containing it was built.
