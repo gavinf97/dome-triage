@@ -13,8 +13,9 @@ human looks at it, and exactly what gets reviewed where:
 | # | Command | Automated output | Human reviews via | Reviewed/approved output |
 |---|---|---|---|---|
 | 1 | `ingest load-sources` → `dedupe consolidate` | `canonical_dataset.csv` | Conflicts page (only flagged conflicts need a fresh look — the rest were already human-labeled in prior curation rounds) | `conflict_resolutions.csv` |
-| 2 | `keywords tfidf`/`keybert`/`build-lexicon` | `keyword_lexicon_candidates.csv` (tens of thousands of candidate terms) | `keywords lexicon-stats` (pick a threshold from real counts) + Keyword Review page (manual approve/reject/edit of the band above that threshold) | `keyword_lexicon.csv` |
-| 3 | `bulk-match fetch --year Y` (repeat per year, human-paced) | per-year raw EPMC query cache | Not reviewed individually — sanity-checked in aggregate (row counts, field completeness) | `bulk-match build-candidates` → `bulk_candidates.csv` |
+| 2 | `keywords tfidf`/`keybert`/`build-lexicon` | `keyword_lexicon_candidates.csv` (tens of thousands of candidate terms) | `keywords lexicon-stats` (pick a threshold from real counts) + Keyword Review page — one term at a time, Positive/Negative/Irrelevant (not locked to whichever candidate pile surfaced it), plus a manual "add a term" path for anything TF-IDF/KeyBERT never extracted | `keywords materialize-lexicon` → `keyword_lexicon.csv` (positive) + `keyword_lexicon_exclusionary.csv` (negative) |
+| 2b | `keywords seed-additional-terms` (curated ML/AI + non-methods-pubtype terms, `src/dome_triage/keywords/curated_terms.py`) → `keywords suggest-final-lexicon` (explainable cleanup) | `keyword_lexicon_added_positive/negative.csv`, then `keyword_lexicon_suggested_final.csv` + `keyword_lexicon_cleanup_log.csv` | Human reads the cleanup log (every removal/flag has a plain-English reason) | Not auto-promoted to row 2's `keyword_lexicon.csv` — a deliberate separate decision |
+| 3 | `bulk-match fetch --year-from Y1 --year-to Y2` (one call, e.g. 2000–2026; still one EPMC query per year internally, checkpointed/resumable) | per-year raw EPMC query cache + `bulk_match_summary.csv` (AI-only/ML-only/combined-deduplicated counts, dated) | Not reviewed individually — sanity-checked in aggregate (row counts, field completeness, the printed count breakdown) | `bulk-match build-candidates` → `bulk_candidates.csv` |
 | 4 | `keywords scoring-bakeoff` | comparison report (`scoring_bakeoff_report.csv`) | Human reads the report and picks the winning scorer(s) — a real decision point | recorded choice (used as `--scorer`) |
 | 5 | `keywords score-bulk-match --scorer <chosen>` | `bulk_candidates_scored.csv` (`match_score` per record) | Not reviewed directly — this is what the stratified sample is drawn from | — |
 | 6 | `sampling stratify` (human sets `cap_per_stratum` first) | `stratified_candidate_pool.csv` — **this file's size is the number of new papers needing manual review** | **Curate app** (`docker compose up curate`) — one paper at a time: positive / negative / undeterminable / skipped, plus structured feature flags, MeSH shown for context | Folded into `canonical_dataset.csv` via `curate materialize` |
@@ -56,12 +57,45 @@ Docker, README, AGENTS.md, CC BY 4.0 license, GitHub remote, CLI skeleton, confi
   config-driven structured feature checklist (`configs/curation_features.yaml` — a living
   checklist, not a fixed schema), and a conflict-resolution page (`src/dome_triage/curate/`).
 - TF-IDF + KeyBERT keyword extraction producing a scored keyword lexicon, seeded from
-  `MLit-Triage-Nextflow/categorized_terms.csv`, with a `lexicon-stats` threshold tool and a
-  human review checkpoint (`src/dome_triage/keywords/`).
+  `MLit-Triage-Nextflow/categorized_terms.csv`, with a `lexicon-stats` threshold tool and a real
+  human review checkpoint (`src/dome_triage/keywords/`, `curate/term_review_state.py`,
+  `curate/pages/3_Keyword_Review.py`): every term gets one of three final decisions — positive,
+  negative (exclusionary), or irrelevant — independent of which candidate pile surfaced it, plus
+  a manual-entry path for terms TF-IDF/KeyBERT never extracted at all. Validated with a first real
+  curation round (500 decisions: 314 positive / 5 negative / 181 irrelevant).
+- **Exclusionary lexicon** (`keyword_lexicon_exclusionary.csv`): the negative tail of
+  `discriminative_score` — terms disproportionately common in the negative/rejected corpus,
+  reviewed the same way as the positive lexicon — subtracted as a penalty by
+  `Bm25Scorer`/`TfidfCosineScorer`/`WeightedSumScorer` (`src/dome_triage/keywords/scoring.py`,
+  `--exclusionary-weight`). Grounded in a real architectural finding: BM25 and TF-IDF-cosine both
+  flatten every lexicon term to unigram tokens before scoring, so a phrase like "machine learning"
+  gives no extra precision over the bare unigrams "machine"/"learning" — the exclusionary lexicon
+  is what actually lets a necessary-but-generic word (e.g. "forest") get down-weighted without
+  losing the specific phrase ("random forest") that still needs it.
+- **Curated term additions + explainable cleanup** (`src/dome_triage/keywords/curated_terms.py`,
+  `lexicon_cleanup.py`; `keywords seed-additional-terms` / `keywords suggest-final-lexicon`): a
+  version-controlled batch of well-known ML/AI vocabulary (supervised/unsupervised algorithms,
+  generative model terms, agentic/LLM terms, a small set of flagship biodata-type terms) and
+  non-methods publication-type negative terms (review, commentary, editorial, systematic review,
+  etc.), added as a separate tier — never merged directly into the human-curated lexicon. A
+  rule-based (not black-box) cleanup combines it with the curated lexicon into a reviewed
+  "suggested final" lexicon: exact-duplicate removal, redundant-unigram-subsumed-by-a-longer-phrase
+  removal (with a reviewed exception allowlist for specific standalone abbreviations like `svm`/
+  `cnn`/`xgboost`), and cross-list tension flagging (a negative unigram overlapping a positive
+  phrase's token is kept, never silently removed, but logged with which phrase(s) it dampens).
+  Every action logged to `keyword_lexicon_cleanup_log.csv`; nothing auto-promotes to production.
 - **Bulk blunt-match candidate construction** (`src/dome_triage/ingest/bulk_match.py`): queries
-  all of Europe PMC for `"artificial intelligence"` OR `"machine learning"` one year at a time
-  (`resultType=core`), capturing full metadata (title/abstract/authors/journal/year/DOI/PMID/
-  PMCID/MeSH headings/pub types/open-access/author keywords) in one pass, no separate enrichment.
+  all of Europe PMC for `"artificial intelligence"` OR `"machine learning"` (`resultType=core`),
+  capturing full metadata (title/abstract/authors/journal/year/DOI/PMID/PMCID/MeSH headings/pub
+  types/open-access/author keywords) in one pass, no separate enrichment. `bulk-match fetch
+  --year-from --year-to` fetches an entire year range (e.g. 2000–2026) in a single invocation —
+  still one checkpointed, resumable EPMC query per year internally, with live per-year terminal
+  progress, but no longer manually re-triggered per year. Also reports a genuine AI-only/
+  ML-only/combined-deduplicated hit-count breakdown for the requested range via three cheap
+  count-only queries (`EpmcClient.count`, pageSize=1, `resultType=idlist` — no second full-metadata
+  fetch), logged with a run date to `bulk_match_summary.csv`. `configs/sources.yaml`'s
+  `epmc.page_size` is 1000 (Europe PMC's documented cursorMark-pagination max) to minimize HTTP
+  round-trips for a multi-decade fetch.
 - **Relevance-matching bake-off** (`src/dome_triage/keywords/scoring.py`,
   `scoring_bakeoff.py`): three scorers (weighted-sum, BM25, TF-IDF cosine) empirically compared
   against the already-known-labeled records before any is trusted on the unlabeled bulk pool —

@@ -1,4 +1,12 @@
-from dome_triage.ingest.bulk_match import core_result_to_raw_record
+import pytest
+
+from dome_triage.ingest import bulk_match
+from dome_triage.ingest.bulk_match import (
+    _range_query,
+    core_result_to_raw_record,
+    count_ai_ml_breakdown,
+    fetch_ai_ml_range,
+)
 
 # Field structure confirmed via a live Europe PMC resultType=core fetch.
 SAMPLE_RESULT = {
@@ -61,3 +69,60 @@ def test_core_result_to_raw_record_handles_missing_optional_fields():
     assert record.mesh_headings == []
     assert record.pub_types == []
     assert record.fulltext_available is False
+
+
+def test_range_query_builds_expected_date_bounded_query():
+    query = _range_query(2000, 2026)
+    assert query == '("artificial intelligence" OR "machine learning") AND (FIRST_PDATE:[2000-01-01 TO 2026-12-31])'
+
+
+def test_range_query_accepts_a_single_term_query():
+    query = _range_query(2010, 2010, '"machine learning"')
+    assert query == '("machine learning") AND (FIRST_PDATE:[2010-01-01 TO 2010-12-31])'
+
+
+def test_fetch_ai_ml_range_fetches_each_year_in_order(monkeypatch, tmp_path):
+    fetched_years = []
+
+    def fake_fetch(client, year, checkpoint_dir):
+        fetched_years.append(year)
+        return checkpoint_dir / f"bulk_match_{year}.jsonl"
+
+    monkeypatch.setattr(bulk_match, "fetch_ai_ml_candidates", fake_fetch)
+
+    paths = fetch_ai_ml_range(client=object(), year_from=2020, year_to=2023, checkpoint_dir=tmp_path)
+
+    assert fetched_years == [2020, 2021, 2022, 2023]
+    assert paths == [tmp_path / f"bulk_match_{y}.jsonl" for y in fetched_years]
+
+
+def test_fetch_ai_ml_range_rejects_year_to_before_year_from(tmp_path):
+    with pytest.raises(ValueError):
+        fetch_ai_ml_range(client=object(), year_from=2023, year_to=2020, checkpoint_dir=tmp_path)
+
+
+class _FakeCountClient:
+    def __init__(self, counts_by_query: dict):
+        self.counts_by_query = counts_by_query
+        self.queries_seen = []
+
+    def count(self, query: str) -> int:
+        self.queries_seen.append(query)
+        return self.counts_by_query[query]
+
+
+def test_count_ai_ml_breakdown_queries_ai_ml_and_combined_separately():
+    ai_query = '("artificial intelligence") AND (FIRST_PDATE:[2000-01-01 TO 2001-12-31])'
+    ml_query = '("machine learning") AND (FIRST_PDATE:[2000-01-01 TO 2001-12-31])'
+    combined_query = (
+        '("artificial intelligence" OR "machine learning") AND '
+        "(FIRST_PDATE:[2000-01-01 TO 2001-12-31])"
+    )
+    client = _FakeCountClient({ai_query: 100, ml_query: 200, combined_query: 250})
+
+    breakdown = count_ai_ml_breakdown(client, 2000, 2001)
+
+    assert breakdown == {"ai_count": 100, "ml_count": 200, "combined_count": 250}
+    # combined must be <= ai + ml in any real dataset (overlap only shrinks it) -- a sanity
+    # invariant on the fake data itself, not the function, but worth asserting explicitly.
+    assert breakdown["combined_count"] <= breakdown["ai_count"] + breakdown["ml_count"]

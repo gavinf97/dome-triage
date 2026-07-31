@@ -23,12 +23,17 @@ def _tokens(term: str) -> list[str]:
 
 
 def clean_lexicon(
-    positive_df: pd.DataFrame, negative_df: pd.DataFrame
+    positive_df: pd.DataFrame,
+    negative_df: pd.DataFrame,
+    protected_unigrams: frozenset = frozenset(),
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Applies, in order: (1) exact-duplicate removal, (2) stray short-term removal, (3)
-    within-list phrase-subsumption removal, (4) cross-list tension flagging (never removed).
-    `positive_df`/`negative_df` must already be the fully combined pool (tier 1 + tier 2) -- this
-    function only cleans, it doesn't merge. Returns (cleaned_positive, cleaned_negative, log)."""
+    within-list phrase-subsumption removal (skipping anything in `protected_unigrams` -- see
+    keywords/curated_terms.py::PROTECTED_UNIGRAMS -- kept and logged instead of removed), (4)
+    cross-list tension flagging (never removed). `positive_df`/`negative_df` must already be the
+    fully combined pool (tier 1 + tier 2) -- this function only cleans, it doesn't merge. Returns
+    (cleaned_positive, cleaned_negative, log)."""
+    protected_unigrams = {_normalize(t) for t in protected_unigrams}
     log_rows: list[dict] = []
 
     positive_df, log = _drop_exact_duplicates(positive_df, "positive")
@@ -41,9 +46,9 @@ def clean_lexicon(
     negative_df, log = _drop_short_terms(negative_df, "negative")
     log_rows.extend(log)
 
-    positive_df, log = _drop_subsumed_unigrams(positive_df, "positive")
+    positive_df, log = _drop_subsumed_unigrams(positive_df, "positive", protected_unigrams)
     log_rows.extend(log)
-    negative_df, log = _drop_subsumed_unigrams(negative_df, "negative")
+    negative_df, log = _drop_subsumed_unigrams(negative_df, "negative", protected_unigrams)
     log_rows.extend(log)
 
     log_rows.extend(_flag_cross_list_tension(positive_df, negative_df))
@@ -85,12 +90,16 @@ def _drop_short_terms(df: pd.DataFrame, list_name: str, min_length: int = 3) -> 
     return df[~is_short], log
 
 
-def _drop_subsumed_unigrams(df: pd.DataFrame, list_name: str) -> tuple[pd.DataFrame, list[dict]]:
+def _drop_subsumed_unigrams(
+    df: pd.DataFrame, list_name: str, protected_unigrams: set = frozenset()
+) -> tuple[pd.DataFrame, list[dict]]:
     """A unigram term subsumed by a longer phrase already in the SAME list: the "unigram that's
     only really relevant as part of a bigram" case. BM25/TF-IDF-cosine (keywords/scoring.py) flatten
     every lexicon term to unigram tokens before scoring, so a standalone "learning" entry
     contributes nothing beyond what "machine learning" already contributes once decomposed -- it
-    only adds broader, noisier matching (any use of the bare word, not just the ML sense)."""
+    only adds broader, noisier matching (any use of the bare word, not just the ML sense).
+    Exception: `protected_unigrams` (specific technical abbreviations, not generic words) are kept
+    and logged as such rather than removed."""
     if df.empty:
         return df, []
     terms = df["term"].tolist()
@@ -103,21 +112,37 @@ def _drop_subsumed_unigrams(df: pd.DataFrame, list_name: str) -> tuple[pd.DataFr
         if len(tokens) != 1:
             continue
         subsuming = [p for p in multiword_terms if term != p and tokens[0] in _tokens(p)]
-        if subsuming:
-            to_remove.append(term)
+        if not subsuming:
+            continue
+        if tokens[0] in protected_unigrams:
             log.append(
                 {
                     "term": term,
                     "list": list_name,
-                    "action": "removed",
+                    "action": "kept_flagged",
                     "reason": (
-                        f"redundant unigram: subsumed by phrase(s) {subsuming!r} already in the "
-                        "same list -- BM25/TF-IDF-cosine flatten phrases to unigram tokens anyway "
-                        "(see keywords/scoring.py), so this adds no marginal discriminative "
-                        "signal, only broader/noisier matching"
+                        f"kept -- explicitly protected (see keywords/curated_terms.py::"
+                        f"PROTECTED_UNIGRAMS) despite being subsumed by phrase(s) {subsuming!r}: "
+                        "specific enough as a standalone technical term/abbreviation to carry "
+                        "real signal on its own, unlike a generic word"
                     ),
                 }
             )
+            continue
+        to_remove.append(term)
+        log.append(
+            {
+                "term": term,
+                "list": list_name,
+                "action": "removed",
+                "reason": (
+                    f"redundant unigram: subsumed by phrase(s) {subsuming!r} already in the "
+                    "same list -- BM25/TF-IDF-cosine flatten phrases to unigram tokens anyway "
+                    "(see keywords/scoring.py), so this adds no marginal discriminative "
+                    "signal, only broader/noisier matching"
+                ),
+            }
+        )
     cleaned = df[~df["term"].isin(to_remove)]
     return cleaned, log
 

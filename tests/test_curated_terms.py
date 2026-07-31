@@ -1,4 +1,8 @@
-from dome_triage.keywords.curated_terms import ADDED_NEGATIVE_TERMS, ADDED_POSITIVE_TERMS
+from dome_triage.keywords.curated_terms import (
+    ADDED_NEGATIVE_TERMS,
+    ADDED_POSITIVE_TERMS,
+    PROTECTED_UNIGRAMS,
+)
 
 
 def test_no_internal_duplicates_within_positive_terms():
@@ -26,3 +30,9 @@ def test_every_entry_has_a_term_and_category():
 def test_terms_are_lowercase_matching_candidate_file_convention():
     for entry in ADDED_POSITIVE_TERMS + ADDED_NEGATIVE_TERMS:
         assert entry["term"] == entry["term"].lower(), entry["term"]
+
+
+def test_protected_unigrams_are_single_lowercase_tokens():
+    for term in PROTECTED_UNIGRAMS:
+        assert term == term.lower(), term
+        assert " " not in term, f"{term!r} is not a single token -- protection only applies to unigrams"

@@ -6,15 +6,17 @@ before returning -- no generated file without a provenance entry (AGENTS.md rule
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 
 from dome_triage.config import PipelineConfig, resolve_path
+from dome_triage.curate.state import backup_file
 from dome_triage.curate.term_review_state import materialize_term_events
 from dome_triage.dedupe.consolidate import conflicts_dataframe, consolidate, to_dataframe
 from dome_triage.fulltext.manifest import build_manifest
-from dome_triage.ingest.bulk_match import fetch_ai_ml_candidates, load_bulk_match_year
+from dome_triage.ingest.bulk_match import count_ai_ml_breakdown, fetch_ai_ml_range, load_bulk_match_year
 from dome_triage.ingest.clear_negative_sampler import fetch_clear_negatives
 from dome_triage.ingest.enrich import enrich_missing_metadata
 from dome_triage.ingest.epmc_client import EpmcClient
@@ -23,7 +25,11 @@ from dome_triage.ingest.source_loaders import (
     load_all_sources,
     raw_records_to_dataframe,
 )
-from dome_triage.keywords.curated_terms import ADDED_NEGATIVE_TERMS, ADDED_POSITIVE_TERMS
+from dome_triage.keywords.curated_terms import (
+    ADDED_NEGATIVE_TERMS,
+    ADDED_POSITIVE_TERMS,
+    PROTECTED_UNIGRAMS,
+)
 from dome_triage.keywords.keybert_extract import extract_keybert_terms
 from dome_triage.keywords.lexicon import build_candidate_lexicon, lexicon_stats, load_seed_terms
 from dome_triage.keywords.lexicon_cleanup import clean_lexicon
@@ -290,6 +296,8 @@ def step_keywords_seed_additional_terms(cfg: PipelineConfig) -> None:
     added_positive_path = resolve_path(cfg.pipeline["keywords"]["added_positive_terms"])
     added_negative_path = resolve_path(cfg.pipeline["keywords"]["added_negative_terms"])
     added_positive_path.parent.mkdir(parents=True, exist_ok=True)
+    backup_file(added_positive_path)
+    backup_file(added_negative_path)
 
     pd.DataFrame(positive_rows, columns=_ADDED_TERM_COLUMNS).to_csv(added_positive_path, index=False)
     pd.DataFrame(negative_rows, columns=_ADDED_TERM_COLUMNS).to_csv(added_negative_path, index=False)
@@ -335,12 +343,17 @@ def step_keywords_suggest_final_lexicon(cfg: PipelineConfig) -> None:
         pd.concat(negative_frames, ignore_index=True) if negative_frames else pd.DataFrame(columns=_ADDED_TERM_COLUMNS)
     )
 
-    cleaned_positive, cleaned_negative, log_df = clean_lexicon(positive_df, negative_df)
+    cleaned_positive, cleaned_negative, log_df = clean_lexicon(
+        positive_df, negative_df, protected_unigrams=PROTECTED_UNIGRAMS
+    )
 
     suggested_lexicon_path = resolve_path(cfg.pipeline["keywords"]["suggested_lexicon"])
     suggested_exclusionary_path = resolve_path(cfg.pipeline["keywords"]["suggested_exclusionary_lexicon"])
     suggested_log_path = resolve_path(cfg.pipeline["keywords"]["suggested_cleanup_log"])
     suggested_lexicon_path.parent.mkdir(parents=True, exist_ok=True)
+    backup_file(suggested_lexicon_path)
+    backup_file(suggested_exclusionary_path)
+    backup_file(suggested_log_path)
 
     cleaned_positive.to_csv(suggested_lexicon_path, index=False)
     cleaned_negative.to_csv(suggested_exclusionary_path, index=False)
@@ -434,9 +447,12 @@ def step_keywords_scoring_bakeoff(cfg: PipelineConfig, exclusionary_weight: floa
     )
 
 
-def step_bulk_match_fetch(cfg: PipelineConfig, year: int) -> None:
-    """Fetches one year of AI/ML-matching Europe PMC records. Human-triggered, one year at a
-    time -- see AGENTS.md's human-led execution rule."""
+def step_bulk_match_fetch(cfg: PipelineConfig, year_from: int, year_to: int) -> None:
+    """Fetches every year in [year_from, year_to] of AI/ML-matching Europe PMC records in one
+    invocation -- one EPMC query per year internally (checkpointed/resumable via existing .done
+    markers), live per-year progress printed for a human watching a long multi-year run. Also
+    computes and appends the AI-only/ML-only/combined-deduplicated hit-count breakdown for the
+    requested range to bulk_match_summary.csv (three cheap count-only queries, no extra fetch)."""
     started_at = time.monotonic()
     checkpoint_dir = cfg.path("interim_dir") / "bulk_match_cache"
     epmc_cfg = cfg.sources.get("epmc", {})
@@ -447,22 +463,43 @@ def step_bulk_match_fetch(cfg: PipelineConfig, year: int) -> None:
         backoff_factor=epmc_cfg.get("backoff_factor", 1.5),
     )
     try:
-        output_path = fetch_ai_ml_candidates(client, year, checkpoint_dir)
+        output_paths = fetch_ai_ml_range(client, year_from, year_to, checkpoint_dir)
+        breakdown = count_ai_ml_breakdown(client, year_from, year_to)
     finally:
         client.close()
+
+    print(
+        f"AI-mentioning: {breakdown['ai_count']} | ML-mentioning: {breakdown['ml_count']} | "
+        f"Combined (deduplicated): {breakdown['combined_count']}"
+    )
+
+    summary_path = cfg.path("processed_dir") / "bulk_match_summary.csv"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_row = {
+        "run_date_utc": datetime.now(timezone.utc).isoformat(),
+        "year_from": year_from,
+        "year_to": year_to,
+        **breakdown,
+    }
+    header_needed = not summary_path.exists()
+    pd.DataFrame([summary_row]).to_csv(summary_path, mode="a", header=header_needed, index=False)
 
     finish_step(
         "bulk-match.fetch",
         inputs=[],
-        outputs=[output_path],
-        params={"year": year},
+        outputs=output_paths + [summary_path],
+        params={"year_from": year_from, "year_to": year_to, **breakdown},
+        notes=f"{len(output_paths)} year(s) fetched ({year_from}-{year_to})",
         started_at=started_at,
     )
 
 
 def step_bulk_match_build_candidates(cfg: PipelineConfig) -> None:
-    """Consolidates every *completed* per-year JSONL cache into one deduplicated candidate pool.
-    Rerun anytime after fetching more years to pick up newly completed ones."""
+    """Consolidates every *completed* per-year JSONL cache (still one file per year on disk even
+    when `bulk-match fetch --year-from --year-to` fetched a whole range in a single invocation --
+    that's an internal checkpointing detail, not something the human triggers) into one
+    deduplicated candidate pool, keyed on pmcid. Rerun anytime after fetching more years to pick
+    up newly completed ones."""
     started_at = time.monotonic()
     checkpoint_dir = cfg.path("interim_dir") / "bulk_match_cache"
     all_records = []

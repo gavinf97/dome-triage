@@ -78,6 +78,32 @@ def test_real_regression_case_forest_random_neural_kept_and_flagged_not_removed(
     assert "random forest" in forest_reason
 
 
+def test_protected_unigram_is_kept_and_flagged_not_removed():
+    # "svm" is a real, specific standalone term (unlike "learning"/"model") -- explicitly
+    # protected so it survives the subsumption rule.
+    positive = _terms_df(["svm", "support vector machine svm"])
+    negative = _terms_df([])
+
+    cleaned_positive, _, log = clean_lexicon(positive, negative, protected_unigrams={"svm"})
+
+    assert "svm" in cleaned_positive["term"].tolist()
+    svm_log = log[log["term"] == "svm"]
+    assert len(svm_log) == 1
+    assert svm_log.iloc[0]["action"] == "kept_flagged"
+    assert "protected" in svm_log.iloc[0]["reason"]
+
+
+def test_unigram_not_in_protected_set_is_still_removed_when_subsumed():
+    positive = _terms_df(["svm", "support vector machine svm"])
+    negative = _terms_df([])
+
+    # No protection this time -- default behavior.
+    cleaned_positive, _, log = clean_lexicon(positive, negative)
+
+    assert "svm" not in cleaned_positive["term"].tolist()
+    assert log[log["term"] == "svm"].iloc[0]["action"] == "removed"
+
+
 def test_negative_unigram_with_no_positive_overlap_is_not_flagged():
     positive = _terms_df(["machine learning"])
     negative = _terms_df(["editorial"])

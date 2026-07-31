@@ -16,9 +16,10 @@ them, it's the executable, loggable version of the same sequence.
 5. Fill in the **Log** block for that step (date, actual numbers, any decision you made) before
    moving on. This file is git-tracked, so your log becomes part of the project's own audit
    trail alongside `data/provenance.jsonl`.
-6. Steps 1–7 below are already done — they're logged retroactively from `data/provenance.jsonl`
-   and the files already on disk, so the record is continuous from the start even though I
-   (Claude) verified them on 2026-07-31 rather than you running them live.
+6. Steps 1–8d below are already done. Steps 1–7 are logged retroactively from
+   `data/provenance.jsonl` and the files already on disk (I verified them on 2026-07-31 rather
+   than you running them live); Step 8 onward (the keyword lexicon curation) you actually ran
+   yourself, logged live as it happened.
 
 Everything runs via Docker Compose — two services defined in `docker-compose.yml`:
 `pipeline` (an interactive shell for one-off `dome-triage <command>` invocations) and `curate`
@@ -27,16 +28,21 @@ PMC is queried unauthenticated, and all configuration is via the YAML files in `
 
 ---
 
-## Status snapshot (verified 2026-07-31)
+## Status snapshot (verified 2026-07-31, updated after Step 8's keyword lexicon curation)
 
 | Phase | State |
 |---|---|
 | Phase 0 — repo scaffold | ✅ Done |
-| Phase 1 — data consolidation → curation | 🟡 Half run: consolidation + keyword-lexicon-candidates done; keyword review, bulk-match, scoring, sampling, and the actual curation session are **not yet run** |
+| Phase 1 — data consolidation → curation | 🟡 Consolidation + keyword lexicon (Steps 1–8d, incl. a real curation round and the 3-tier lexicon system) done; bulk-match, scoring-bakeoff, sampling, clear-negatives, and the paper-level curation session (Steps 9–16) are **not yet run** |
 | Phases 2–8 (EDAM tagging, classifiers, calibration, bulk scan, daily pipeline) | ⬜ Not implemented — no code exists yet beyond stub `__init__.py` files. Nothing to run here; see the closing section. |
 
 Canonical dataset right now: **4,329 records** (`data/processed/canonical_dataset.csv`), with
 **9 flagged conflicts** awaiting resolution (`data/processed/conflicts_for_review.csv`).
+
+Keyword lexicon right now (see Steps 8–8d): a real 500-decision curation round is done
+(314 positive / 5 negative / 181 irrelevant), plus a curated batch of ML/AI terms I (Claude) added
+on top, cleaned up into a reviewed "suggested final" lexicon — **296 positive / 18 negative
+(exclusionary) terms**, three tiers kept on disk separately (see Step 8's sub-steps).
 
 ---
 
@@ -61,8 +67,8 @@ tokenize or extract keywords.
 timestamps for both images.
 
 **Log:**
-- [ ] Run on: __________
-- Actual output: __________
+- [✅] Run on: 31 st July, 2026
+- Actual output: Containers built successfully no errors
 - Decision/notes: __________
 
 ---
@@ -130,77 +136,235 @@ keybert_score_mean, seed_tfidf_score, seed_category, review_status, notes` (all 
 
 ---
 
-## Step 8 — Keyword Review (human, Streamlit) — NEXT ACTION
+## Step 8 — Keyword Review (human, Streamlit) ✅
 
 **What's happening / why:** 40,756 candidate terms is too many to trust or review one by one.
-Step 7's numbers let you pick a defensible cutoff (e.g. `discriminative_score ≥ 0.005` → 81
-terms, or `document_frequency ≥ 5` → 112 terms — these bands overlap significantly and are a
-reasonable manageable review size). You then approve/reject/edit exactly those candidates in the
-UI. Only `review_status=approved` rows become the trusted lexicon.
+Step 7's numbers let you pick a defensible cutoff. This step got substantially rebuilt during the
+session from a first pass (a single 40k-row editable table) into a real one-at-a-time curation
+interface (`src/dome_triage/curate/pages/3_Keyword_Review.py`,
+`src/dome_triage/curate/term_review_state.py`) — see `ROADMAP.md`'s Phase 1 section for the full
+design rationale. Every term gets one of **three** final decisions, not a binary approve/reject:
+
+- **Positive** — feeds `keyword_lexicon.csv`.
+- **Negative** — an exclusionary/negative-tail term (disproportionately common in the negative/
+  rejected corpus) — feeds `keyword_lexicon_exclusionary.csv`, which `keywords/scoring.py`'s
+  BM25/TF-IDF-cosine scorers subtract as a penalty.
+- **Irrelevant** — useful as neither — feeds `keyword_lexicon_irrelevant.csv`, audit-only.
+
+Two browsable piles ("Positive candidates" / "Exclusionary candidates" toggle at the top of the
+page) are just a navigation aid — the decision you record for a term isn't locked to whichever
+pile surfaced it, so a term you're browsing as a "positive candidate" can still be marked Negative
+or Irrelevant. A separate "Add a term manually" box lets you classify any term directly, whether
+or not TF-IDF/KeyBERT ever extracted it.
 
 **Command:**
 ```bash
 docker compose up curate
 # browse to http://localhost:8501, open the "Keyword Review" page in the sidebar
 ```
-In the data-editor table: sort/inspect by `discriminative_score` and `document_frequency`, set
-`review_status` to `approved` for terms you trust as genuinely discriminative (vs. generic words
-like "model"/"learning" that appear high but aren't useful lexicon entries), `rejected` for
-noise, leave `pending` for anything you're unsure about (it just won't be included). Click
-**"Save reviewed lexicon"**.
+Set your curator name on the Home page first. Pick a pile, set the threshold (live count shown),
+and for each term click **Positive** / **Negative** / **Irrelevant** / **Skip** (skip doesn't log
+anything — the term just reappears later). Every decision writes immediately to
+`data/processed/keyword_review_events.csv` (backed up before every write) — nothing is final until
+Step 8b folds it into the real lexicon files.
 
-**Expected output:** `data/processed/keyword_lexicon.csv` created, containing only the approved
-rows; a success message in the UI stating how many terms were saved.
+**Expected output:** `data/processed/keyword_review_events.csv` grows by one row per decision.
 
-**Validate before continuing:** Open the new `keyword_lexicon.csv` and spot-check that it's not
-empty and doesn't contain obvious junk (single letters, stopword-like generic ML terms with no
-discriminative value).
+**Validate before continuing:** Tail the events file between clicks to confirm it's actually
+writing; spot-check that Skip doesn't add a row.
 
 Stop the container when done: `Ctrl+C` in the terminal running `docker compose up curate`.
 
 **Log:**
-- [ ] Run on: __________
-- Threshold(s) used: __________
-- Terms approved / rejected / left pending: __________
-- Decision/notes: __________
+- [x] Run on: 31st July 2026 (interface rebuilt this session; first real curation round completed
+  the same day)
+- Session: 2026-07-31T19:13:48Z → 2026-07-31T19:36:05Z UTC, curator "Gavin"
+- **500 decisions total: 314 positive / 5 negative / 181 irrelevant**
+- Decision/notes: the 5 negative decisions (`forest`, `random`, `neural`, `area`, `bayes`) are all
+  single generic words that are also tokens inside positive multi-word terms you separately
+  approved (`random forest`, `neural network`, `area under curve` variants, `naive bayes`) — a
+  deliberate exclusionary counterweight to their generic sense. See Step 8d's cleanup log for how
+  this got surfaced and handled, not silently resolved either way.
 
 ---
 
-## Step 9 — Bulk blunt-match fetch (repeat per year — human-paced)
+## Step 8b — Materialize the keyword lexicon (tier 1: your curated decisions) ✅
 
-**What's happening / why:** Queries all of Europe PMC for `"artificial intelligence"` OR
-`"machine learning"`, one year at a time, capturing full metadata (title/abstract/authors/
-journal/year/DOI/PMID/PMCID/MeSH headings/pub types/open-access/author keywords). This is
-**deliberately one command per year** (`ROADMAP.md`, Phase 1) so you can inspect each year's
-result before deciding whether to fetch another. **There is no fixed number of years specified
-in the docs — that's your call.** A reasonable starting point: fetch one recent year, check the
-row count and field completeness, then decide how many more years you actually want feeding the
-candidate pool (more years = bigger curation workload later, see Step 13).
+**What's happening / why:** Folds `keyword_review_events.csv` from Step 8 into the three real
+lexicon files — last decision per term wins, regardless of which pile or manual entry produced
+it. This is what makes your curation session actually count; it's also, unlike `curate
+materialize` (the paper-curation equivalent), a provenance-logged step, since `keyword_lexicon.csv`
+is a first-class pipeline artifact consumed downstream by `scoring-bakeoff`/`score-bulk-match`.
 
-**Command (run once per year you choose):**
+**Command:**
 ```bash
-docker compose run --rm pipeline dome-triage bulk-match fetch --year 2024
+docker compose run --rm pipeline dome-triage keywords materialize-lexicon
 ```
-Repeat with `--year 2023`, `--year 2022`, etc. as you decide.
 
-**Expected output:** A per-year raw query cache under `data/interim/` (exact filename logged by
-the command itself and in `data/provenance.jsonl`). The command prints the row count fetched for
-that year.
+**Expected output:** `keyword_lexicon.csv` (positive), `keyword_lexicon_exclusionary.csv`
+(negative), `keyword_lexicon_irrelevant.csv` (irrelevant); `keyword_lexicon_candidates.csv`'s
+`review_status` column synced in place.
 
-**Validate before continuing:** Row count is non-trivial (thousands, not zero) and MeSH/journal
-fields look populated, not mostly blank.
+**Validate before continuing:** Row counts match Step 8's session totals.
 
 **Log:**
-- [ ] Years fetched: __________ (list each, with row count from output)
-- Run on: __________
-- Decision/notes on how many years and why: __________
+- [x] Run on: 31st July 2026
+- **Output: `keyword_lexicon.csv` 314 rows / `keyword_lexicon_exclusionary.csv` 5 rows /
+  `keyword_lexicon_irrelevant.csv` 181 rows** — matches Step 8's session exactly.
+- Decision/notes: these are your files — nothing below (Steps 8c/8d) ever modifies them.
+
+---
+
+## Step 8c — Seed additional curated terms (tier 2: my curated additions) ✅
+
+**What's happening / why:** A batch of well-known ML/AI vocabulary and non-methods
+publication-type words that either weren't reached yet in Step 8's session or (for current
+agentic/LLM terminology) barely exist in this training corpus at all. Written to `src/dome_triage/
+keywords/curated_terms.py` (version-controlled, reviewable via git diff, not a CSV) and expanded
+into their own tier-2 files — **never merged into tier 1's files above**. Anything already
+decided in Step 8 is automatically skipped; anything that does exist in the 40,756-row candidate
+file gets its real `discriminative_score`/`document_frequency` carried over, blank otherwise.
+
+**Command:**
+```bash
+docker compose run --rm pipeline dome-triage keywords seed-additional-terms
+```
+
+**Expected output:** `keyword_lexicon_added_positive.csv`, `keyword_lexicon_added_negative.csv`.
+
+**Validate before continuing:** Spot-check a few terms' stats against
+`keyword_lexicon_candidates.csv`.
+
+**Log:**
+- [x] Run on: 31st July 2026
+- **45/46 positive terms added** (1 correctly *not duplicated* here — `knn`: you'd already
+  marked it positive yourself in Step 8's session, so it's already sitting in tier 1's
+  `keyword_lexicon.csv` and carries through into tier 3 untouched; adding it again here would've
+  just been a redundant duplicate row, not a fix), across ML
+  algorithms (supervised: linear regression, naive bayes, lightgbm, k-nearest neighbors, RNN,
+  LSTM, transformer; unsupervised: k-means, hierarchical clustering, DBSCAN, PCA, t-SNE, UMAP,
+  autoencoder, Gaussian mixture model, self-organizing map), generative model terms (GAN, VAE,
+  diffusion model, generative AI), agentic/LLM terms (LLM, AI agent, agentic AI, multi-agent
+  system, RAG, foundation model, prompt engineering, fine-tuning), and flagship biodata terms
+  (proteomics, genomics, transcriptomics, metabolomics, microbiome, metagenomics, single-cell,
+  multi-omics).
+- **14/14 negative terms added**: non-methods publication-type words (perspective, review,
+  commentary, editorial, opinion, viewpoint, case report, letter to the editor, narrative review,
+  correspondence, news, systematic review, meta-analysis, survey).
+- Decision/notes: no EDAM ontology reference file exists anywhere on this machine — biodata terms
+  are general domain knowledge, deliberately kept small. Some flagship biodata terms actually have
+  a slightly *negative* `discriminative_score` in isolation (e.g. genomics, proteomics) — that's
+  expected, not a bug: TF-IDF's positive-vs-negative differential is tuned to detect ML-methodology
+  signal, and the negative/baseline corpus is itself ~69% plain bioscience papers, so a domain word
+  alone doesn't discriminate FOR machine learning application. Included anyway on domain-relevance
+  grounds, not empirical differential — flagged here for transparency.
+
+---
+
+## Step 8d — Suggest final cleaned lexicon (tier 3: reviewed suggestion) ✅
+
+**What's happening / why:** Combines tier 1 (Step 8b) + tier 2 (Step 8c) and runs an explainable,
+rule-based cleanup (`src/dome_triage/keywords/lexicon_cleanup.py`) — never a black-box dedup.
+Four rules, every action logged: (1) exact duplicates dropped, (2) stray ≤2-character terms
+dropped, (3) a unigram redundant with a longer phrase already in the *same* list dropped (e.g. a
+bare "learning" contributes nothing beyond what "machine learning" already gives BM25/TF-IDF-cosine,
+since both scorers flatten every lexicon term to unigram tokens before scoring — see
+`keywords/scoring.py`) — **except** a small set of `PROTECTED_UNIGRAMS`
+(`svm`/`cnn`/`roc`/`xgboost`/`regression`/`classifier`/`classification`/`autoencoder`, per your
+explicit review) which are specific enough as standalone terms to keep even when subsumed, (4) a
+negative unigram that overlaps a positive phrase's token is **kept, never removed** (an explicit
+human decision stands) but flagged with which phrase(s) it dampens. Tier 1's live files are never
+touched by this step — promoting tier 3 to production (i.e. actually pointing `scoring-bakeoff`/
+`score-bulk-match` at it) is a separate, manual decision, not automatic.
+
+**Command:**
+```bash
+docker compose run --rm pipeline dome-triage keywords suggest-final-lexicon
+```
+
+**Expected output:** `keyword_lexicon_suggested_final.csv`, `keyword_lexicon_exclusionary_
+suggested_final.csv`, `keyword_lexicon_cleanup_log.csv`.
+
+**Validate before continuing:** Read the cleanup log — check every "removed" entry you're unsure
+about, and every "kept_flagged" tension entry.
+
+**Log:**
+- [x] Run on: 31st July 2026 (re-run once, after reviewing the first log and adding the
+  `PROTECTED_UNIGRAMS` allowlist above)
+- **Combined pool: 359 positive (314 + 45) / 19 negative (5 + 14) before cleanup.**
+- **Suggested final: 296 positive / 18 negative.** Cleanup log: 77 entries — 64 removed (exact
+  dupes + genuinely generic redundant unigrams: `model`, `learning`, `network`, `accuracy`,
+  `training`, `value`, and ~60 more), 13 kept-and-flagged (8 protected abbreviations above + 5
+  cross-list tensions: `forest`/`random`/`neural`/`area`/`bayes`, each logged with exactly which
+  positive phrase(s) it dampens).
+- Decision/notes: **✅ promoted to production 31st July 2026.** Old tier 1 archived as
+  `keyword_lexicon_tier1_original_pre_promotion.csv` / `keyword_lexicon_exclusionary_tier1_
+  original_pre_promotion.csv` (314 / 5 rows — your original curated-only lexicon, kept for
+  reference, never overwritten again). Tier 3's 296/18 files were copied over the live
+  `keyword_lexicon.csv`/`keyword_lexicon_exclusionary.csv` — this is what `scoring-bakeoff`/
+  `score-bulk-match` now actually read. (Done via `docker compose run --rm pipeline bash -c "cp
+  keyword_lexicon_suggested_final.csv keyword_lexicon.csv; cp
+  keyword_lexicon_exclusionary_suggested_final.csv keyword_lexicon_exclusionary.csv"` — run inside
+  the container because the host user can't write these root-owned files directly, see Step 0's
+  known friction point.)
+
+---
+
+## Step 9 — Bulk blunt-match fetch (one command, full year range)
+
+**What's happening / why:** Queries all of Europe PMC for `"artificial intelligence"` OR
+`"machine learning"`, capturing full metadata (title/abstract/authors/journal/year/DOI/PMID/
+PMCID/MeSH headings/pub types/open-access/author keywords) in one pass. **This used to require one
+manual command per year — changed on your explicit instruction.** `bulk-match fetch` now takes
+`--year-from`/`--year-to` and fetches the whole range in a single invocation
+(`src/dome_triage/ingest/bulk_match.py::fetch_ai_ml_range`). Under the hood it still runs one EPMC
+query per year (checkpointed via a per-year `.done` marker in `data/interim/bulk_match_cache/`, so
+an interrupted run resumes at the next incomplete year rather than starting over) — that's just an
+internal resumability detail now, not something you trigger by hand. Each year prints a live tqdm
+progress bar plus a `--- bulk-match fetch: <year> ---` line as it starts, so a long multi-decade
+run stays visible in your terminal the whole time, not silent. `configs/sources.yaml`'s
+`epmc.page_size` was bumped 100→1000 (Europe PMC's documented max for cursorMark pagination) so
+the same total records need far fewer HTTP round-trips.
+
+Also computes and prints + logs a genuine count breakdown for the requested range — how many
+records mention "artificial intelligence" alone, "machine learning" alone, and the combined
+deduplicated total (EPMC's own OR-query semantics return each matching record exactly once even
+if it matches both phrases, so this total needs no separate dedup step) — via three cheap
+count-only queries (`EpmcClient.count`, pageSize=1, resultType=idlist), not a second full fetch.
+
+**Command (one call, covers everything from year 2000 through today):**
+```bash
+docker compose run --rm pipeline dome-triage bulk-match fetch --year-from 2000 --year-to 2026
+```
+
+**Expected output:** One raw JSONL cache per year under `data/interim/bulk_match_cache/`
+(`bulk_match_<year>.jsonl` + `.done` marker), plus `data/processed/bulk_match_summary.csv`
+(appended to, one row per run: `run_date_utc, year_from, year_to, ai_count, ml_count,
+combined_count`) — **this is the "clear final count of papers of each, AI/ML/total, with dates"
+log file.** The terminal prints a live progress bar per year as it runs, then the final counts.
+
+**Validate before continuing:** `combined_count` should be less than `ai_count + ml_count` (some
+overlap is expected — papers mentioning both). Row counts non-trivial for recent years, thinner
+for early-2000s years (real — AI/ML terminology was far less common in abstracts back then).
+
+**Log:**
+- [ ] Run on: __________
+- **AI-mentioning: __________ | ML-mentioning: __________ | Combined (deduplicated): __________**
+  (also in `data/processed/bulk_match_summary.csv`, dated)
+- Decision/notes: __________
 
 ---
 
 ## Step 10 — Build bulk candidate pool
 
-**What's happening / why:** Consolidates every year fetched in Step 9 into one deduplicated
-candidate pool.
+**What's happening / why:** Consolidates every year's checkpoint file from Step 9 into one
+deduplicated candidate pool, keyed on `pmcid`. **Still needed even though Step 9 is now one
+command**, not per-year consolidation you manually trigger — Step 9 still writes one JSONL file
+per year internally (for checkpointing/resumability), so something still has to merge those files
+into a single pool before scoring/sampling can use it. This step is that merge; nothing about it
+changed. It does not need to separately dedupe "AI vs ML" — Step 9's combined query already
+returns each matching record exactly once, so any duplication this step removes is purely
+cross-year (e.g. a record whose date metadata put it on a year boundary).
 
 **Command:**
 ```bash
@@ -210,8 +374,8 @@ docker compose run --rm pipeline dome-triage bulk-match build-candidates
 **Expected output:** `data/interim/bulk_candidates.csv` (per `configs/sampling.yaml`'s
 `paths.bulk_candidates`).
 
-**Validate before continuing:** Row count roughly matches the sum of the per-year fetches minus
-expected duplicates.
+**Validate before continuing:** Row count roughly matches Step 9's `combined_count` from
+`bulk_match_summary.csv`, minus any cross-year duplicates.
 
 **Log:**
 - [ ] Run on: __________

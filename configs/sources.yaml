@@ -131,7 +131,11 @@ dedup:
 
 epmc:
   base_url: https://www.ebi.ac.uk/europepmc/webservices/rest
-  page_size: 100
+  # 1000 is Europe PMC's documented max pageSize for cursorMark-paginated search -- fewer, larger
+  # pages means fewer HTTP round-trips for the same total records, which matters most for
+  # bulk-match's multi-decade fetch. If EPMC ever rejects it, the existing Retry/backoff surfaces
+  # a clear error rather than failing silently.
+  page_size: 1000
   max_retries: 5
   backoff_factor: 1.5
 

@@ -65,6 +65,23 @@ ADDED_POSITIVE_TERMS: list[dict[str, str]] = [
     {"term": "multi-omics", "category": "biodata_flagship"},
 ]
 
+# Specific technical abbreviations/terms that should survive keywords/lexicon_cleanup.py's
+# within-list subsumption rule even when they're a token inside a longer approved phrase (e.g.
+# "svm" inside "support vector machine svm") -- unlike genuinely generic words ("model",
+# "learning", "network"), these are specific enough on their own to carry real signal. Reviewed
+# and confirmed explicitly by the user after inspecting the first suggest-final-lexicon run's
+# cleanup log.
+PROTECTED_UNIGRAMS: set[str] = {
+    "svm",
+    "cnn",
+    "roc",
+    "xgboost",
+    "regression",
+    "classifier",
+    "classification",
+    "autoencoder",
+}
+
 ADDED_NEGATIVE_TERMS: list[dict[str, str]] = [
     {"term": "perspective", "category": "non_methods_pubtype"},
     {"term": "review", "category": "non_methods_pubtype"},

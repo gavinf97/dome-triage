@@ -164,13 +164,15 @@ def keywords_score_bulk_match(
 
 @bulk_match_app.command("fetch")
 def bulk_match_fetch(
-    year: int = typer.Option(..., "--year", help="Fetch one year at a time, e.g. --year 2024."),
+    year_from: int = typer.Option(..., "--year-from", help="First year to fetch (inclusive)."),
+    year_to: int = typer.Option(..., "--year-to", help="Last year to fetch (inclusive)."),
     config_dir: str = _CONFIG_DIR_OPTION,
 ) -> None:
-    """Fetches every AI/ML-matching Europe PMC record for one year (resultType=core, full
-    metadata incl. MeSH). Deliberately one year per invocation -- inspect the result before
-    deciding whether to fetch another year."""
-    pipeline_steps.step_bulk_match_fetch(_load_config(config_dir), year)
+    """Fetches every AI/ML-matching Europe PMC record (resultType=core, full metadata incl. MeSH)
+    for the whole [year_from, year_to] range in one invocation -- one EPMC query per year
+    internally (checkpointed, resumable), with live per-year progress and a printed + logged
+    AI-only/ML-only/combined-deduplicated count breakdown."""
+    pipeline_steps.step_bulk_match_fetch(_load_config(config_dir), year_from, year_to)
 
 
 @bulk_match_app.command("build-candidates")

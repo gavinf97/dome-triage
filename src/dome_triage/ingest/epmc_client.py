@@ -88,6 +88,16 @@ class EpmcClient:
         finally:
             pbar.close()
 
+    def count(self, query: str) -> int:
+        """Cheap count-only lookup: one HTTP request, pageSize=1, resultType=idlist (no full
+        metadata for even the single sample row) -- purely to read the API's own `hitCount`, not
+        to iterate results. Used for the AI-only/ML-only/combined breakdown counts in
+        ingest/bulk_match.py, so getting that breakdown never requires a second full fetch."""
+        params = {"query": query, "pageSize": 1, "format": "json", "resultType": "idlist"}
+        resp = self.session.get(f"{self.base_url}/search", params=params, timeout=60)
+        resp.raise_for_status()
+        return resp.json().get("hitCount", 0)
+
     def get_by_ids(
         self, ids: list[str], id_type: Literal["pmcid", "pmid", "doi"]
     ) -> dict[str, dict]:

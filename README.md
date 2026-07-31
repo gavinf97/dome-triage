@@ -58,8 +58,8 @@ docker compose run --rm pipeline dome-triage keywords build-lexicon
 docker compose run --rm pipeline dome-triage keywords lexicon-stats   # pick a cutoff from real counts
 # ... approve terms above that cutoff via the Streamlit "Keyword Review" page ...
 
-# 3. Bulk blunt-match candidate construction (one year at a time -- see ROADMAP.md for scale)
-docker compose run --rm pipeline dome-triage bulk-match fetch --year 2024
+# 3. Bulk blunt-match candidate construction (whole year range in one call -- see ROADMAP.md)
+docker compose run --rm pipeline dome-triage bulk-match fetch --year-from 2000 --year-to 2026
 docker compose run --rm pipeline dome-triage bulk-match build-candidates
 
 # 4. Pick a relevance-scoring algorithm empirically, then score and sample
