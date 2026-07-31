@@ -106,11 +106,49 @@ def keywords_lexicon_stats(config_dir: str = _CONFIG_DIR_OPTION) -> None:
     pipeline_steps.step_keywords_lexicon_stats(_load_config(config_dir))
 
 
+@keywords_app.command("materialize-lexicon")
+def keywords_materialize_lexicon(config_dir: str = _CONFIG_DIR_OPTION) -> None:
+    """Folds keyword_review_events.csv (from the Streamlit Keyword Review page) into
+    keyword_lexicon.csv (positive), keyword_lexicon_exclusionary.csv (negative), and
+    keyword_lexicon_irrelevant.csv (irrelevant) -- last decision per term wins, regardless of
+    which pile or manual entry produced it."""
+    pipeline_steps.step_keywords_materialize_lexicon(_load_config(config_dir))
+
+
+@keywords_app.command("seed-additional-terms")
+def keywords_seed_additional_terms(config_dir: str = _CONFIG_DIR_OPTION) -> None:
+    """Writes keywords/curated_terms.py's curated positive/negative additions (ML algorithms,
+    generative/agentic/LLM terms, flagship biodata terms, non-methods publication-type terms) to
+    their own tier-2 files -- separate from your human-curated tier-1 lexicon/exclusionary_lexicon,
+    skipping anything already decided."""
+    pipeline_steps.step_keywords_seed_additional_terms(_load_config(config_dir))
+
+
+@keywords_app.command("suggest-final-lexicon")
+def keywords_suggest_final_lexicon(config_dir: str = _CONFIG_DIR_OPTION) -> None:
+    """Combines tier 1 (materialized lexicon/exclusionary_lexicon) with tier 2 (added terms),
+    runs the explainable cleanup heuristic (redundant-unigram removal, cross-list tension
+    flagging), and writes tier 3 -- suggested_lexicon / suggested_exclusionary_lexicon / a
+    cleanup log. Never modifies tier 1's live files; promoting tier 3 to production is manual."""
+    pipeline_steps.step_keywords_suggest_final_lexicon(_load_config(config_dir))
+
+
+_EXCLUSIONARY_WEIGHT_OPTION = typer.Option(
+    1.0,
+    "--exclusionary-weight",
+    help="Penalty weight applied to the exclusionary lexicon's score, if "
+    "data/processed/keyword_lexicon_exclusionary.csv exists (from `keywords materialize-lexicon`).",
+)
+
+
 @keywords_app.command("scoring-bakeoff")
-def keywords_scoring_bakeoff(config_dir: str = _CONFIG_DIR_OPTION) -> None:
+def keywords_scoring_bakeoff(
+    exclusionary_weight: float = _EXCLUSIONARY_WEIGHT_OPTION,
+    config_dir: str = _CONFIG_DIR_OPTION,
+) -> None:
     """Validates every relevance-scoring algorithm against the already-known-labeled records
     before trusting any of them to rank the unlabeled bulk pool."""
-    pipeline_steps.step_keywords_scoring_bakeoff(_load_config(config_dir))
+    pipeline_steps.step_keywords_scoring_bakeoff(_load_config(config_dir), exclusionary_weight)
 
 
 @keywords_app.command("score-bulk-match")
@@ -118,9 +156,10 @@ def keywords_score_bulk_match(
     scorer: str = typer.Option(
         "weighted-sum", "--scorer", help='One of "weighted-sum", "bm25", "tfidf-cosine", or "all".'
     ),
+    exclusionary_weight: float = _EXCLUSIONARY_WEIGHT_OPTION,
     config_dir: str = _CONFIG_DIR_OPTION,
 ) -> None:
-    pipeline_steps.step_keywords_score_bulk_match(_load_config(config_dir), scorer)
+    pipeline_steps.step_keywords_score_bulk_match(_load_config(config_dir), scorer, exclusionary_weight)
 
 
 @bulk_match_app.command("fetch")

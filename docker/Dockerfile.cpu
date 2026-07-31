@@ -17,8 +17,9 @@ RUN git config --global --add safe.directory /app
 
 COPY pyproject.toml README.md LICENSE.md ./
 COPY src/ src/
+COPY tests/ tests/
 
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir -e ".[dev]"
 
 # Bake in NLTK corpora and the KeyBERT/sentence-transformers model weights at build time, so
 # containers never need network access at runtime just to tokenize or extract keywords.

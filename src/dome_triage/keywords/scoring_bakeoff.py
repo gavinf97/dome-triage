@@ -29,13 +29,19 @@ def run_bakeoff(
     texts: list[str],
     true_labels: list[int],
     lexicon_terms: list[str],
+    exclusionary_terms: list[str] | None = None,
+    exclusionary_weight: float = 1.0,
 ) -> pd.DataFrame:
-    """`true_labels` must be 1 for positive / 0 for negative -- already-labeled records only."""
+    """`true_labels` must be 1 for positive / 0 for negative -- already-labeled records only.
+    `exclusionary_terms`, if given, lets the bake-off reflect the actual production scoring
+    approach (positive lexicon minus exclusionary penalty) rather than positive-only scoring."""
     labels = pd.Series(true_labels)
     rows = []
 
     for name, scorer in scorers.items():
-        scored = scorer.score_corpus(texts, lexicon_terms)
+        scored = scorer.score_corpus(
+            texts, lexicon_terms, exclusionary_terms=exclusionary_terms, exclusionary_weight=exclusionary_weight
+        )
         scores = pd.Series([s for s, _ in scored])
 
         try:

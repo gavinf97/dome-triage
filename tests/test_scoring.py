@@ -51,3 +51,41 @@ def test_tfidf_cosine_scorer_ranks_relevant_document_higher():
     corpus = [RELEVANT_DOC, IRRELEVANT_DOC, *FILLER_DOCS]
     results = scorer.score_corpus(corpus, LEXICON_TERMS)
     assert results[0][0] > results[1][0]
+
+
+# "genomic data" appears in RELEVANT_DOC but isn't one of LEXICON_TERMS -- a plausible
+# exclusionary/negative-tail term (see curate/term_review_state.py) that should pull the score
+# down when supplied, without affecting which lexicon terms are reported as matched.
+EXCLUSIONARY_TERMS = ["genomic data"]
+
+
+def test_weighted_sum_scorer_subtracts_exclusionary_matches():
+    weights = {t: 1.0 for t in LEXICON_TERMS}
+    scorer = WeightedSumScorer(weights)
+    without_penalty, matched = scorer.score_corpus([RELEVANT_DOC], LEXICON_TERMS)[0]
+    with_penalty, matched_with_penalty = scorer.score_corpus(
+        [RELEVANT_DOC], LEXICON_TERMS, exclusionary_terms=EXCLUSIONARY_TERMS, exclusionary_weight=1.0
+    )[0]
+
+    assert with_penalty == without_penalty - 1.0
+    assert matched_with_penalty == matched  # exclusionary terms never appear in the matched list
+
+
+def test_bm25_scorer_exclusionary_terms_reduce_score():
+    scorer = Bm25Scorer()
+    corpus = [RELEVANT_DOC, IRRELEVANT_DOC, *FILLER_DOCS]
+    without_penalty = scorer.score_corpus(corpus, LEXICON_TERMS)[0][0]
+    with_penalty = scorer.score_corpus(
+        corpus, LEXICON_TERMS, exclusionary_terms=EXCLUSIONARY_TERMS, exclusionary_weight=1.0
+    )[0][0]
+    assert with_penalty < without_penalty
+
+
+def test_tfidf_cosine_scorer_exclusionary_terms_reduce_score():
+    scorer = TfidfCosineScorer()
+    corpus = [RELEVANT_DOC, IRRELEVANT_DOC, *FILLER_DOCS]
+    without_penalty = scorer.score_corpus(corpus, LEXICON_TERMS)[0][0]
+    with_penalty = scorer.score_corpus(
+        corpus, LEXICON_TERMS, exclusionary_terms=EXCLUSIONARY_TERMS, exclusionary_weight=1.0
+    )[0][0]
+    assert with_penalty < without_penalty

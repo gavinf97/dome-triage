@@ -11,6 +11,7 @@ from pathlib import Path
 import pandas as pd
 
 from dome_triage.config import PipelineConfig, resolve_path
+from dome_triage.curate.term_review_state import materialize_term_events
 from dome_triage.dedupe.consolidate import conflicts_dataframe, consolidate, to_dataframe
 from dome_triage.fulltext.manifest import build_manifest
 from dome_triage.ingest.bulk_match import fetch_ai_ml_candidates, load_bulk_match_year
@@ -22,8 +23,10 @@ from dome_triage.ingest.source_loaders import (
     load_all_sources,
     raw_records_to_dataframe,
 )
+from dome_triage.keywords.curated_terms import ADDED_NEGATIVE_TERMS, ADDED_POSITIVE_TERMS
 from dome_triage.keywords.keybert_extract import extract_keybert_terms
 from dome_triage.keywords.lexicon import build_candidate_lexicon, lexicon_stats, load_seed_terms
+from dome_triage.keywords.lexicon_cleanup import clean_lexicon
 from dome_triage.keywords.scoring import SCORERS, WeightedSumScorer, load_lexicon_terms_and_weights
 from dome_triage.keywords.scoring_bakeoff import run_bakeoff
 from dome_triage.keywords.tfidf_extract import extract_tfidf_terms
@@ -196,6 +199,168 @@ def step_keywords_build_lexicon(cfg: PipelineConfig) -> None:
     )
 
 
+def step_keywords_materialize_lexicon(cfg: PipelineConfig) -> None:
+    """Folds keyword_review_events.csv (from the Streamlit Keyword Review page) into
+    keyword_lexicon.csv (positive), keyword_lexicon_exclusionary.csv (negative), and
+    keyword_lexicon_irrelevant.csv (irrelevant) -- last decision per term wins, regardless of
+    which pile or manual entry produced it. Unlike `curate materialize`, this calls finish_step:
+    keyword_lexicon.csv is a first-class pipeline artifact consumed by
+    scoring-bakeoff/score-bulk-match, not a dataset that already has provenance from earlier
+    ingest/dedupe steps."""
+    started_at = time.monotonic()
+    candidates_path = resolve_path(cfg.pipeline["keywords"]["candidates"])
+    events_path = resolve_path(cfg.pipeline["keyword_review"]["events_log"])
+    lexicon_path = resolve_path(cfg.pipeline["keywords"]["lexicon"])
+    exclusionary_path = resolve_path(cfg.pipeline["keywords"]["exclusionary_lexicon"])
+    irrelevant_path = resolve_path(cfg.pipeline["keyword_review"]["irrelevant_terms"])
+
+    counts = materialize_term_events(
+        candidates_path, events_path, lexicon_path, exclusionary_path, irrelevant_path
+    )
+
+    finish_step(
+        "keywords.materialize-lexicon",
+        inputs=[candidates_path, events_path],
+        outputs=[lexicon_path, exclusionary_path, irrelevant_path, candidates_path],
+        notes=f"{counts['positive']} positive / {counts['negative']} negative / "
+        f"{counts['irrelevant']} irrelevant",
+        started_at=started_at,
+    )
+
+
+def _lookup_candidate_stats(candidates_df: pd.DataFrame, term: str):
+    match = candidates_df[candidates_df["term"].str.lower() == term.lower()]
+    if match.empty:
+        return None, None
+    row = match.iloc[0]
+    return row.get("discriminative_score"), row.get("document_frequency")
+
+
+def _already_present_terms(*paths: Path) -> set[str]:
+    terms: set[str] = set()
+    for path in paths:
+        if path.exists():
+            df = pd.read_csv(path, dtype=str)
+            if "term" in df.columns:
+                terms |= set(df["term"].dropna().str.lower())
+    return terms
+
+
+_ADDED_TERM_COLUMNS = ["term", "discriminative_score", "document_frequency", "source", "notes"]
+
+
+def step_keywords_seed_additional_terms(cfg: PipelineConfig) -> None:
+    """Writes keywords/curated_terms.py's positive/negative additions to their own tier-2 files
+    (added_positive_terms / added_negative_terms) -- skipping anything already decided in
+    keyword_review_events.csv or already present in the materialized tier-1 lexicon/exclusionary
+    files, and pulling real discriminative_score/document_frequency from
+    keyword_lexicon_candidates.csv where the term was actually extracted (blank otherwise). Never
+    touches the tier-1 files -- see keywords.suggest-final-lexicon for how tier 2 gets combined
+    with tier 1."""
+    started_at = time.monotonic()
+    candidates_path = resolve_path(cfg.pipeline["keywords"]["candidates"])
+    candidates_df = pd.read_csv(candidates_path)
+
+    events_path = resolve_path(cfg.pipeline["keyword_review"]["events_log"])
+    lexicon_path = resolve_path(cfg.pipeline["keywords"]["lexicon"])
+    exclusionary_path = resolve_path(cfg.pipeline["keywords"]["exclusionary_lexicon"])
+    already_decided = _already_present_terms(events_path, lexicon_path, exclusionary_path)
+
+    def _build_rows(term_specs: list[dict]) -> list[dict]:
+        rows = []
+        for spec in term_specs:
+            term = spec["term"]
+            if term.lower() in already_decided:
+                continue
+            discriminative_score, document_frequency = _lookup_candidate_stats(candidates_df, term)
+            rows.append(
+                {
+                    "term": term,
+                    "discriminative_score": discriminative_score,
+                    "document_frequency": document_frequency,
+                    "source": f"claude_seed_{spec['category']}",
+                    "notes": spec["category"],
+                }
+            )
+        return rows
+
+    positive_rows = _build_rows(ADDED_POSITIVE_TERMS)
+    negative_rows = _build_rows(ADDED_NEGATIVE_TERMS)
+
+    added_positive_path = resolve_path(cfg.pipeline["keywords"]["added_positive_terms"])
+    added_negative_path = resolve_path(cfg.pipeline["keywords"]["added_negative_terms"])
+    added_positive_path.parent.mkdir(parents=True, exist_ok=True)
+
+    pd.DataFrame(positive_rows, columns=_ADDED_TERM_COLUMNS).to_csv(added_positive_path, index=False)
+    pd.DataFrame(negative_rows, columns=_ADDED_TERM_COLUMNS).to_csv(added_negative_path, index=False)
+
+    finish_step(
+        "keywords.seed-additional-terms",
+        inputs=[candidates_path]
+        + ([events_path] if events_path.exists() else [])
+        + ([lexicon_path] if lexicon_path.exists() else [])
+        + ([exclusionary_path] if exclusionary_path.exists() else []),
+        outputs=[added_positive_path, added_negative_path],
+        notes=f"{len(positive_rows)}/{len(ADDED_POSITIVE_TERMS)} positive, "
+        f"{len(negative_rows)}/{len(ADDED_NEGATIVE_TERMS)} negative added "
+        "(rest skipped -- already decided)",
+        started_at=started_at,
+    )
+
+
+def step_keywords_suggest_final_lexicon(cfg: PipelineConfig) -> None:
+    """Combines tier 1 (materialized keyword_lexicon.csv / keyword_lexicon_exclusionary.csv) with
+    tier 2 (keyword_lexicon_added_positive.csv / _added_negative.csv), runs the cleanup heuristic
+    (keywords/lexicon_cleanup.py::clean_lexicon), and writes tier 3: suggested_lexicon,
+    suggested_exclusionary_lexicon, suggested_cleanup_log. Never modifies tier 1's live files --
+    promoting tier 3 to production is a separate, manual decision."""
+    started_at = time.monotonic()
+    lexicon_path = resolve_path(cfg.pipeline["keywords"]["lexicon"])
+    exclusionary_path = resolve_path(cfg.pipeline["keywords"]["exclusionary_lexicon"])
+    added_positive_path = resolve_path(cfg.pipeline["keywords"]["added_positive_terms"])
+    added_negative_path = resolve_path(cfg.pipeline["keywords"]["added_negative_terms"])
+
+    if not lexicon_path.exists():
+        raise FileNotFoundError(f"{lexicon_path} not found -- run `keywords materialize-lexicon` first.")
+    if not added_positive_path.exists():
+        raise FileNotFoundError(f"{added_positive_path} not found -- run `keywords seed-additional-terms` first.")
+
+    positive_df = pd.concat(
+        [pd.read_csv(lexicon_path), pd.read_csv(added_positive_path)], ignore_index=True
+    )
+    negative_frames = [pd.read_csv(exclusionary_path)] if exclusionary_path.exists() else []
+    if added_negative_path.exists():
+        negative_frames.append(pd.read_csv(added_negative_path))
+    negative_df = (
+        pd.concat(negative_frames, ignore_index=True) if negative_frames else pd.DataFrame(columns=_ADDED_TERM_COLUMNS)
+    )
+
+    cleaned_positive, cleaned_negative, log_df = clean_lexicon(positive_df, negative_df)
+
+    suggested_lexicon_path = resolve_path(cfg.pipeline["keywords"]["suggested_lexicon"])
+    suggested_exclusionary_path = resolve_path(cfg.pipeline["keywords"]["suggested_exclusionary_lexicon"])
+    suggested_log_path = resolve_path(cfg.pipeline["keywords"]["suggested_cleanup_log"])
+    suggested_lexicon_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cleaned_positive.to_csv(suggested_lexicon_path, index=False)
+    cleaned_negative.to_csv(suggested_exclusionary_path, index=False)
+    log_df.to_csv(suggested_log_path, index=False)
+
+    n_removed = int((log_df["action"] == "removed").sum()) if not log_df.empty else 0
+    n_flagged = int((log_df["action"] == "kept_flagged").sum()) if not log_df.empty else 0
+
+    finish_step(
+        "keywords.suggest-final-lexicon",
+        inputs=[lexicon_path, added_positive_path]
+        + ([exclusionary_path] if exclusionary_path.exists() else [])
+        + ([added_negative_path] if added_negative_path.exists() else []),
+        outputs=[suggested_lexicon_path, suggested_exclusionary_path, suggested_log_path],
+        notes=f"{len(cleaned_positive)} positive / {len(cleaned_negative)} negative terms "
+        f"suggested; {n_removed} removed, {n_flagged} flagged (tension) -- see cleanup log",
+        started_at=started_at,
+    )
+
+
 def step_keywords_lexicon_stats(cfg: PipelineConfig) -> None:
     """Prints (and saves) term-counts remaining at a range of thresholds -- the data-driven
     cutoff decision support tool, since reviewing all ~40k raw candidates by hand isn't
@@ -217,9 +382,11 @@ def step_keywords_lexicon_stats(cfg: PipelineConfig) -> None:
     )
 
 
-def step_keywords_scoring_bakeoff(cfg: PipelineConfig) -> None:
+def step_keywords_scoring_bakeoff(cfg: PipelineConfig, exclusionary_weight: float = 1.0) -> None:
     """Validates every MatchScorer against the already-known-labeled records in
-    canonical_dataset.csv before any scorer is trusted to rank the unlabeled bulk pool."""
+    canonical_dataset.csv before any scorer is trusted to rank the unlabeled bulk pool. If
+    keyword_lexicon_exclusionary.csv exists (from `keywords materialize-lexicon`), the bake-off
+    reflects the actual production approach (positive lexicon minus exclusionary penalty)."""
     started_at = time.monotonic()
     lexicon_path = cfg.path("processed_dir") / "keyword_lexicon.csv"
     if not lexicon_path.exists():
@@ -228,6 +395,12 @@ def step_keywords_scoring_bakeoff(cfg: PipelineConfig) -> None:
         )
     lexicon_df = pd.read_csv(lexicon_path)
     lexicon_terms, term_weights = load_lexicon_terms_and_weights(lexicon_df)
+
+    exclusionary_path = resolve_path(cfg.pipeline["keywords"]["exclusionary_lexicon"])
+    exclusionary_terms: list[str] = []
+    if exclusionary_path.exists():
+        exclusionary_df = pd.read_csv(exclusionary_path)
+        exclusionary_terms, _ = load_lexicon_terms_and_weights(exclusionary_df)
 
     dataset = pd.read_csv(cfg.path("canonical_dataset"), dtype=str)
     labeled = dataset[dataset["label"].isin(["positive", "negative"])].copy()
@@ -238,7 +411,14 @@ def step_keywords_scoring_bakeoff(cfg: PipelineConfig) -> None:
         "weighted-sum": WeightedSumScorer(term_weights),
         **{name: cls() for name, cls in SCORERS.items() if name != "weighted-sum"},
     }
-    report = run_bakeoff(scorers, texts, true_labels, lexicon_terms)
+    report = run_bakeoff(
+        scorers,
+        texts,
+        true_labels,
+        lexicon_terms,
+        exclusionary_terms=exclusionary_terms or None,
+        exclusionary_weight=exclusionary_weight,
+    )
 
     output_path = cfg.path("processed_dir") / "scoring_bakeoff_report.csv"
     report.to_csv(output_path, index=False)
@@ -246,8 +426,9 @@ def step_keywords_scoring_bakeoff(cfg: PipelineConfig) -> None:
 
     finish_step(
         "keywords.scoring-bakeoff",
-        inputs=[lexicon_path, cfg.path("canonical_dataset")],
+        inputs=[lexicon_path, cfg.path("canonical_dataset")] + ([exclusionary_path] if exclusionary_terms else []),
         outputs=[output_path],
+        params={"exclusionary_weight": exclusionary_weight, "n_exclusionary_terms": len(exclusionary_terms)},
         notes=f"validated against {len(labeled)} already-labeled records",
         started_at=started_at,
     )
@@ -316,13 +497,23 @@ def _build_scorer(scorer_name: str, term_weights: dict[str, float]):
     return SCORERS[scorer_name]()
 
 
-def step_keywords_score_bulk_match(cfg: PipelineConfig, scorer_name: str) -> None:
+def step_keywords_score_bulk_match(
+    cfg: PipelineConfig, scorer_name: str, exclusionary_weight: float = 1.0
+) -> None:
     """`scorer_name` is one of SCORERS' keys, or "all" to keep every scorer as a separate
-    match_score__<name> column for later comparison."""
+    match_score__<name> column for later comparison. If keyword_lexicon_exclusionary.csv exists
+    (from `keywords materialize-lexicon`), its terms are subtracted as a penalty, weighted by
+    `exclusionary_weight`."""
     started_at = time.monotonic()
     lexicon_path = cfg.path("processed_dir") / "keyword_lexicon.csv"
     lexicon_df = pd.read_csv(lexicon_path)
     lexicon_terms, term_weights = load_lexicon_terms_and_weights(lexicon_df)
+
+    exclusionary_path = resolve_path(cfg.pipeline["keywords"]["exclusionary_lexicon"])
+    exclusionary_terms: list[str] = []
+    if exclusionary_path.exists():
+        exclusionary_df = pd.read_csv(exclusionary_path)
+        exclusionary_terms, _ = load_lexicon_terms_and_weights(exclusionary_df)
 
     candidates_path = cfg.sampling_path("bulk_candidates")
     candidates = pd.read_csv(candidates_path, dtype=str)
@@ -331,7 +522,12 @@ def step_keywords_score_bulk_match(cfg: PipelineConfig, scorer_name: str) -> Non
     names_to_run = list(SCORERS) if scorer_name == "all" else [scorer_name]
     for name in names_to_run:
         scorer = _build_scorer(name, term_weights)
-        scored = scorer.score_corpus(texts, lexicon_terms)
+        scored = scorer.score_corpus(
+            texts,
+            lexicon_terms,
+            exclusionary_terms=exclusionary_terms or None,
+            exclusionary_weight=exclusionary_weight,
+        )
         candidates[f"match_score__{name}"] = [s for s, _ in scored]
         candidates[f"matched_terms__{name}"] = [";".join(terms) for _, terms in scored]
 
@@ -340,9 +536,13 @@ def step_keywords_score_bulk_match(cfg: PipelineConfig, scorer_name: str) -> Non
 
     finish_step(
         "keywords.score-bulk-match",
-        inputs=[lexicon_path, candidates_path],
+        inputs=[lexicon_path, candidates_path] + ([exclusionary_path] if exclusionary_terms else []),
         outputs=[output_path],
-        params={"scorer": scorer_name},
+        params={
+            "scorer": scorer_name,
+            "exclusionary_weight": exclusionary_weight,
+            "n_exclusionary_terms": len(exclusionary_terms),
+        },
         started_at=started_at,
     )
 

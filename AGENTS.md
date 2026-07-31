@@ -69,18 +69,21 @@ src/dome_triage/
 
 ## Running things
 
-Everything runs in Docker (`docker compose build`, then `docker compose run --rm pipeline
-dome-triage <command>`, or `docker compose up curate` for the UI). See `README.md` Quickstart.
-For local (non-Docker) development, install with `pip install -e ".[dev]"` from the repo root —
-note `nltk` corpora and the KeyBERT/sentence-transformers model weights are only guaranteed
-present inside the Docker image (baked in at build time).
+**Docker only. No local venv, no bare `pip install`, no bare `python`/`pytest` on the host.**
+`docker compose build`, then `docker compose run --rm pipeline dome-triage <command>` for every
+CLI step, or `docker compose up curate` for the UI. See `README.md` Quickstart. Do not create a
+`.venv`/`venv` in this repo and do not run project code against the host Python — `nltk` corpora
+and the KeyBERT/sentence-transformers model weights are only present inside the Docker image
+(baked in at build time), so a host-Python run will silently diverge from what the pipeline
+actually does in the container. If a `.venv`/`venv` directory ever appears here, delete it.
 
 ## Testing
 
-`pytest` from the repo root. Tests in `tests/` use small synthetic fixture files in
-`tests/fixtures/` that mimic the schema of each real source file — they must never depend on the
-multi-GB sibling repos (`DOME_Top_Curate`, `DOME-Copilot-Data-Analysis`, etc.) being present,
-since those live outside this repo and aren't guaranteed to exist on every machine or in CI.
+`docker compose run --rm pipeline pytest` from the repo root — not bare `pytest` on the host (see
+above). Tests in `tests/` use small synthetic fixture files in `tests/fixtures/` that mimic the
+schema of each real source file — they must never depend on the multi-GB sibling repos
+(`DOME_Top_Curate`, `DOME-Copilot-Data-Analysis`, etc.) being present, since those live outside
+this repo and aren't guaranteed to exist on every machine or in CI.
 
 ## Data provenance
 
