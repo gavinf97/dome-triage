@@ -28,3 +28,20 @@ services:
     working_dir: /app
     tty: true
     stdin_open: true
+    # Hard memory ceiling -- host has 15GB total. Live-checked (docker stats) that the other
+    # always-on containers here (dome-registry-v2 x3, mongo, mongo-express, ollama) use ~180MB
+    # combined when idle, so 12g leaves ~3GB for those plus host OS/desktop -- comfortable, not
+    # exact science. Direct incidents this responds to, both real, both confirmed: (1) an earlier
+    # version of keywords/preprocess.py's multiprocessing pool spawned 14 workers that each
+    # independently re-imported this app's full torch/transformers dependency chain, ballooned to
+    # ~10-11GB RSS *each*, and the kernel OOM-killer took the whole *host* down (confirmed via
+    # journalctl) -- fixed by switching to fork + memory-aware worker count
+    # (`_default_worker_count()`). (2) even after that fix, at the full 744,647-document corpus,
+    # holding a combined (cleaned, matched) intermediate for the whole corpus plus the two lists
+    # built from it pushed a single run past a 10g cap on its own, correctly OOM-killing *this
+    # container* (confirmed via `docker inspect`'s OOMKilled: true) without touching the host --
+    # fixed by making `parallel_map()` a generator so callers never hold that extra copy. This
+    # limit is the backstop for both: if either fix is ever wrong again, the kernel OOM-kills
+    # something *inside this cgroup*, not an arbitrary process on the host (VS Code, another
+    # project's container, etc).
+    mem_limit: 12g

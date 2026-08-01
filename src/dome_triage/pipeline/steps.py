@@ -696,12 +696,15 @@ def step_keywords_score_bulk_match(
     for i, name in enumerate(names_to_run, start=1):
         print(f"score-bulk-match:   scorer {i}/{len(names_to_run)}: {name}")
         scorer = _build_scorer(name, term_weights, exclusionary_term_weights)
+        checkpoint_path = cfg.path("interim_dir") / f"score_bulk_match_checkpoint__{name}.json"
         scored = scorer.score_corpus(
             texts,
             lexicon_terms,
             exclusionary_terms=exclusionary_terms or None,
             exclusionary_weight=exclusionary_weight,
+            checkpoint_path=checkpoint_path,
         )
+        print(f"score-bulk-match:     progress checkpoint written to {checkpoint_path}")
         candidates[f"match_score__{name}"] = [s for s, _ in scored]
         candidates[f"matched_terms__{name}"] = [";".join(terms) for _, terms in scored]
 

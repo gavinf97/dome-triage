@@ -26,6 +26,14 @@ Everything runs via Docker Compose — two services defined in `docker-compose.y
 (the Streamlit human-curation UI on port 8501). No API keys or `.env` file are needed — Europe
 PMC is queried unauthenticated, and all configuration is via the YAML files in `configs/`.
 
+**Text preprocessing (stopword removal, lemmatization, tokenization, etc.)**: every step below
+that touches paper text (TF-IDF/KeyBERT extraction, all three relevance scorers) applies some
+depth of NLP preprocessing before it does anything else. Rather than duplicate that explanation at
+every step, it's all in one place — **[`PREPROCESSING.md`](PREPROCESSING.md)** — with what's
+applied where, why that specific depth was chosen over the alternatives, and the real (verified,
+not hypothetical) consequences of each choice. Each relevant step below links to the specific
+section rather than repeating it.
+
 ---
 
 ## Status snapshot (verified 2026-07-31, updated after Step 8's keyword lexicon curation)
@@ -100,11 +108,19 @@ Step 1.
 ### Step 4 — TF-IDF keyword extraction ✅
 **Command:** `docker compose run --rm pipeline dome-triage keywords tfidf`
 **Output:** `data/interim/tfidf_terms.csv`
+**Preprocessing applied:** full `clean_text()` pipeline (HTML strip, tokenize, lowercase, stopword
+removal, lemmatize) plus a second sklearn stopword pass and `ngram_range=(1,3)` phrase extraction —
+see [`PREPROCESSING.md`](PREPROCESSING.md#who-calls-this-and-how-much-of-it--with-the-reasoning)
+for exactly why this step gets the heaviest, extraction-specific treatment.
 **Log:** Present on disk as of 2026-07-31. No provenance entry.
 
 ### Step 5 — KeyBERT keyword extraction ✅
 **Command:** `docker compose run --rm pipeline dome-triage keywords keybert`
 **Output:** `data/interim/keybert_terms.csv`
+**Preprocessing applied:** HTML-tag stripping only — deliberately no tokenization/stopword-removal/
+lemmatization, since the transformer embedding model needs natural sentence structure to work
+correctly. See [`PREPROCESSING.md`](PREPROCESSING.md#who-calls-this-and-how-much-of-it--with-the-reasoning)
+for why this is lighter than Step 4's, not an inconsistency.
 **Log:** Present on disk as of 2026-07-31. No provenance entry.
 
 ### Step 6 — Build keyword lexicon candidates ✅
@@ -431,6 +447,12 @@ texts (title + ". " + abstract), and produce one continuous **score per paper** 
 inherently a classifier; see "Is there a threshold cutoff?" below for how a score becomes a
 decision.
 
+**Preprocessing note**: `bm25`/`tfidf-cosine` run the full `clean_text()` pipeline (tokenize,
+lowercase, drop stopwords, drop ≤2-char tokens, lemmatize) over both the corpus and the lexicon
+before scoring anything; `weighted-sum` runs none of that — see
+[`PREPROCESSING.md`](PREPROCESSING.md) for exactly what that pipeline does and why the three
+scorers deliberately don't all get the same depth of it.
+
 - **`weighted-sum`**: for each paper, find every approved positive lexicon term that's a literal
   (case-insensitive) substring anywhere in its text, and add up each matched term's weight (its
   `discriminative_score` from your curation, or 1.0 if it has none). Fully transparent, cheap, and
@@ -541,6 +563,79 @@ for the full comparison against TF-IDF-cosine and weighted-sum) — to every one
 records in the bulk candidate pool (Step 10), producing a `match_score` per record. This is what
 Step 13's stratified sample gets drawn from.
 
+### How the negative (exclusionary) lexicon actually interacts with BM25 — read before relying on it
+
+You asked directly: BM25 treats the lexicon as more-than-one-word units (e.g. "machine learning"),
+but the negative lexicon has single-word terms to exclude (e.g. "learning" alone) — doesn't that
+mismatch make the negative term ineffective? Checked directly against the real code
+(`src/dome_triage/keywords/scoring.py::Bm25Scorer.score_corpus`) and the real production files,
+not assumed:
+
+1. **There is no granularity mismatch — both lists get flattened identically.** BM25's query
+   construction is `clean_text(" ".join(lexicon_terms)).split()` for the positive side, and the
+   *exact same operation* — `clean_text(" ".join(exclusionary_terms)).split()` — for the negative
+   side. The positive lexicon does contain multi-word phrases ("machine learning", "random
+   forest"), but BM25 never scores them as phrases either — see
+   [`PREPROCESSING.md`](PREPROCESSING.md#the-recurring-theme-phrase-flattening) for the general
+   mechanism. Both lists end up as flat bags of unigram tokens before BM25 sees either of them.
+
+2. **"learning" alone is not currently in the negative lexicon.** Checked directly against the
+   live `keyword_lexicon_exclusionary.csv` (18 terms): the single-word negative terms are `area`,
+   `bayes`, `forest`, `neural`, `random` — 5 terms, not `learning`. `learning` did exist in the
+   pre-cleanup candidate pool, but Step 8d's cleanup removed it from the *positive* side as a
+   redundant unigram (subsumed by "machine learning" already being in the same list) — it was
+   never a negative term.
+
+3. **The real mechanism runs the opposite direction from "ineffective."** Because both lists share
+   the same flattened unigram vocabulary, a negative unigram doesn't fail to match — it matches
+   *too broadly*. `forest` in the negative lexicon subtracts BM25 score from every paper containing
+   the word "forest" anywhere, including papers that only contain it because they say "random
+   forest" — a phrase you separately approved as positive. BM25 has no concept of "this occurrence
+   was inside an approved phrase, don't penalize it"; it counts token occurrences, full stop. So
+   the negative lexicon isn't inert here — it's a blunt, word-level filter that also dampens (a
+   weighted subtraction, not a hard exclusion) the exact positive phrases it happens to share a
+   word with.
+
+4. **This was already found and is already logged, for the 5 terms that actually exist today** —
+   `keyword_lexicon_cleanup_log.csv` flags all 5 as `kept_flagged` (kept, not removed — an explicit
+   decision from your original curation, not overridden), each with the exact positive phrase(s)
+   it dampens:
+   - `area` → dampens: area curve, area curve auc, area receiver, area receiver operating
+   - `bayes` → dampens: naive bayes
+   - `forest` → dampens: forest algorithm, forest classifier, forest model, random forest, random
+     forest classifier, random forest model, regression random forest
+   - `neural` → dampens: artificial/convolutional/deep/recurrent neural network, neural network
+     (cnn/model)
+   - `random` → dampens: random forest (+ all variants above), regression random forest
+
+5. **How much this actually subtracts, mechanically**: `score = positive_bm25_score −
+   exclusionary_weight × negative_bm25_score`, with `exclusionary_weight = 1.0` by default — a
+   full, equal-weight subtraction of the negative side's own BM25 score, computed the same
+   IDF/length-normalized way as the positive score (not a flat penalty per match). A paper heavy on
+   "random"/"forest" purely in the "random forest" methodology sense is penalized by roughly what a
+   paper genuinely about the generic, unrelated senses of those words would score — BM25 has no
+   mechanical way to distinguish the two cases.
+
+6. **The `matched_terms__bm25` column you'll see is not what drives the score.** It's computed
+   separately, by literal substring search on the *raw, uncleaned* text (`_find_matched_terms`), so
+   it will correctly show "random forest" as a matched phrase. `match_score__bm25` itself comes
+   from the flattened/lemmatized unigram bag described above — two different code paths. Don't
+   infer the scoring mechanism from what's displayed in `matched_terms__bm25`.
+
+**Retain or unwind `area`/`bayes`/`forest`/`neural`/`random` as negative terms — your call, nothing
+changed here, this section is explanation only:**
+- **Retain (current state).** These words plausibly still carry real negative signal in their
+  *other*, non-methods senses elsewhere across the 745k pool (e.g. "bayes" in an unrelated
+  biographical mention, "area" in a purely geographic/anatomical sense) — and Step 11's real
+  bake-off numbers showed the exclusionary lexicon *did* measurably help BM25's AUROC
+  (0.767→0.774) net of this exact dampening effect, so empirically it isn't outweighing the
+  benefit in aggregate.
+- **Unwind.** Remove these 5 unigrams from `keyword_lexicon_exclusionary.csv` (or scope them to
+  `weighted-sum` only, which does literal-phrase matching and has no such collision). If the
+  negative stream ends up swallowing a lot of genuine "random forest"/"neural network" papers in
+  practice, this cross-token dampening on your most common ML methods is the most likely mechanical
+  cause, and removing just these 5 terms is the targeted fix — not the whole exclusionary lexicon.
+
 As of this rewrite, one command now also adds (`src/dome_triage/pipeline/steps.py::
 step_keywords_score_bulk_match`):
 - **`match_classification__bm25`** (`positive`/`negative`) — the raw score converted to a
@@ -602,13 +697,42 @@ population was close to a 50/50 split — 1,878/1,907 — so a wildly lopsided s
 worth a second look, not necessarily wrong, but worth noticing).
 
 **Log:**
-- [ ] Run on: __________
-- Row count: __________
-- `already_curated` count / %: __________
-- `has_pmcid` count / %: __________
-- Positive / negative split from `match_classification__bm25`: __________
-- Confirmed negative-classified rows are still present in the output file (not dropped): __________
-- Decision/notes: __________
+- [x] Run on: 2026-08-01 (real, full 744,647-doc run — see incident + fix history below)
+- Row count: **744,647** (in = out, confirmed via pandas; provenance's own "745499" figure is the
+  known `wc -l`-style embedded-newline overcount from earlier in this project, not a real
+  discrepancy — pandas is authoritative, see Step 10's log)
+- `already_curated` count / %: **3,713 / 0.5%** (plausible — small, as expected)
+- `has_pmcid` count / %: **587,235 / 78.9%**
+- Positive / negative split from `match_classification__bm25`: **273,927 positive / 470,720
+  negative** (sums exactly to 744,647 — both streams genuinely present, verified directly against
+  the real output file, not just the printed summary)
+- Confirmed negative-classified rows are still present in the output file (not dropped): **yes** —
+  verified directly (`value_counts()` on the real file, not assumed)
+- Duration: **269.6 seconds (4.5 minutes)**, confirmed via `data/provenance.jsonl`
+- Decision/notes: **This run had a real incident behind it, worth keeping on record.** The first
+  attempt (before this session's fixes) ran 11h38m and never finished — `clean_text()` was calling
+  `ensure_nltk_data()` (4 filesystem searches) on every single one of 744,647 documents instead of
+  once; fixed by caching it. A second, deeper problem then surfaced while fixing the first:
+  parallelizing the cleaning step across CPU cores using Python's `spawn` start method caused each
+  worker to independently re-import this whole application (including `torch`, pulled in via
+  `keybert_extract.py`), ballooning to ~10-11GB RSS *per worker* — the kernel OOM-killer fired
+  repeatedly and the *host machine* needed a hard reset (confirmed via `journalctl`). Fixed by
+  switching to `fork` (workers share the parent's already-loaded memory instead of re-importing
+  it) with a worker count capped by *available* memory, not just CPU count
+  (`preprocess.py::_default_worker_count()`), plus a hard `mem_limit: 12g` added to `pipeline`'s
+  Docker Compose service as a backstop so any future memory bug is contained to this one container
+  rather than able to take the host down again. Two more real, measured bottlenecks were found and
+  fixed along the way: `_find_matched_terms` was a second, *silent* single-threaded pass (42.2s for
+  just 150k documents, no progress bar at all) -- folded into the same parallel pass as cleaning;
+  and holding a combined (cleaned-text, matched-terms) list for the whole corpus *plus* the two
+  lists built from it was, on its own, enough to OOM-kill the container even after the `fork` fix
+  -- fixed by making the parallel-processing helper a generator so callers consume results directly
+  into their final structures, never materializing a whole-corpus intermediate copy, plus
+  `sys.intern()`-ing tokens (the corpus has enormous token repetition -- "model"/"patient"/"study"
+  etc. -- so sharing one string object per distinct token instead of ~75 million separate ones was
+  a substantial, measured memory saving). Final verified state: 116/116 tests passing, real
+  744,647-document run completes cleanly in 4.5 minutes, peak container memory comfortably below
+  the 12GB cap, host untouched. See `git log` for this session's commits if you want the full diff.
 
 ---
 

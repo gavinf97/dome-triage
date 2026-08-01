@@ -10,6 +10,12 @@ a time -- BM25 and TF-IDF cosine both need the full corpus to compute their term
 
 from __future__ import annotations
 
+import json
+import sys
+import time
+from datetime import datetime, timezone
+from functools import partial
+from pathlib import Path
 from typing import Protocol
 
 import pandas as pd
@@ -18,9 +24,14 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
 
-from dome_triage.keywords.preprocess import clean_text
+from dome_triage.keywords.preprocess import clean_text, parallel_map
 
 ScoredResult = tuple[float, list[str]]
+
+# Chunk size for the corpus-cleaning stage of bm25/tfidf-cosine: ~5% per chunk (20 chunks) on a
+# large corpus, so a checkpoint file gets written roughly every 5% -- see `_write_checkpoint`. On
+# a small corpus (e.g. tests) this collapses to one chunk per document, never an empty chunk.
+_CHECKPOINT_CHUNKS = 20
 
 
 class MatchScorer(Protocol):
@@ -32,12 +43,35 @@ class MatchScorer(Protocol):
         lexicon_terms: list[str],
         exclusionary_terms: list[str] | None = None,
         exclusionary_weight: float = 1.0,
+        checkpoint_path: Path | None = None,
     ) -> list[ScoredResult]: ...
 
 
 def _find_matched_terms(text: str, lexicon_terms: list[str]) -> list[str]:
     lowered = text.lower()
     return [term for term in lexicon_terms if term.lower() in lowered]
+
+
+def _clean_and_match(text: str, lexicon_terms: list[str]) -> tuple[str, list[str]]:
+    """Combines `clean_text()` + `_find_matched_terms()` into one per-document unit of work, so
+    `parallel_map()` covers both in a single pass/single progress bar. Live-measured reason this
+    matters: run separately, `_find_matched_terms` alone (pure Python substring search, no NLTK)
+    was a second, *silent* (no progress bar) bottleneck -- 42.2s for 150k real documents with zero
+    terminal feedback, found only by explicitly benchmarking it after the cleaning stage's own fix
+    landed. Module-level (not a closure) so it stays picklable for `multiprocessing`."""
+    return clean_text(text), _find_matched_terms(text, lexicon_terms)
+
+
+def _write_checkpoint(checkpoint_path: Path, **fields: object) -> None:
+    """Best-effort progress checkpoint -- a small JSON status file, not the actual scored data
+    (BM25/TF-IDF need the *whole* corpus indexed before any single document's score is valid, so
+    there's no meaningful partial *score* to persist mid-corpus-cleaning). This exists so a run
+    that's killed or crashes leaves real evidence of exactly how far it got, rather than nothing --
+    see STEPS_Progress.md Step 12 for the 12-hour incident this is a direct response to."""
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_text(
+        json.dumps({**fields, "updated_at": datetime.now(timezone.utc).isoformat()}, indent=2)
+    )
 
 
 class WeightedSumScorer:
@@ -72,9 +106,12 @@ class WeightedSumScorer:
         lexicon_terms: list[str],
         exclusionary_terms: list[str] | None = None,
         exclusionary_weight: float = 1.0,
+        checkpoint_path: Path | None = None,
     ) -> list[ScoredResult]:
         results = []
-        for text in tqdm(corpus_texts, desc=f"{self.name}: scoring", unit="doc"):
+        started = time.monotonic()
+        n = len(corpus_texts)
+        for i, text in enumerate(tqdm(corpus_texts, desc=f"{self.name}: scoring", unit="doc"), start=1):
             matched = _find_matched_terms(text, lexicon_terms)
             total = sum(self.term_weights.get(term, 0.0) for term in matched)
             if exclusionary_terms:
@@ -84,6 +121,16 @@ class WeightedSumScorer:
                 )
                 total -= exclusionary_weight * exclusionary_total
             results.append((total, matched))
+            if checkpoint_path and n and i % max(1, n // _CHECKPOINT_CHUNKS) == 0:
+                _write_checkpoint(
+                    checkpoint_path,
+                    scorer=self.name,
+                    stage="scoring",
+                    processed=i,
+                    total=n,
+                    pct_complete=round(i / n * 100, 1),
+                    elapsed_seconds=round(time.monotonic() - started, 1),
+                )
         return results
 
 
@@ -108,21 +155,70 @@ class Bm25Scorer:
         lexicon_terms: list[str],
         exclusionary_terms: list[str] | None = None,
         exclusionary_weight: float = 1.0,
+        checkpoint_path: Path | None = None,
     ) -> list[ScoredResult]:
-        tokenized_corpus = []
-        matched_terms = []
-        for text in tqdm(corpus_texts, desc="bm25: cleaning + tokenizing corpus", unit="doc"):
-            tokenized_corpus.append(clean_text(text).split())
-            matched_terms.append(_find_matched_terms(text, lexicon_terms))
+        n = len(corpus_texts)
+        started = time.monotonic()
 
-        print(f"bm25: indexing {len(tokenized_corpus)} documents and scoring...")
+        def _on_progress(processed: int, total: int) -> None:
+            elapsed = time.monotonic() - started
+            rate = processed / elapsed if elapsed > 0 else 0.0
+            eta = (total - processed) / rate if rate > 0 else 0.0
+            print(
+                f"bm25: {processed}/{total} docs cleaned+matched ({processed / total * 100:.1f}%) -- "
+                f"{elapsed:.0f}s elapsed, ~{eta:.0f}s remaining, {rate:.1f} docs/sec"
+            )
+            if checkpoint_path:
+                _write_checkpoint(
+                    checkpoint_path,
+                    scorer=self.name,
+                    stage="cleaning",
+                    processed=processed,
+                    total=total,
+                    pct_complete=round(processed / total * 100, 1),
+                    elapsed_seconds=round(elapsed, 1),
+                )
+
+        # Consume the generator straight into the two target lists -- never materializes a
+        # combined (cleaned, matched) intermediate for the whole corpus. At 744,647 real
+        # documents, holding that intermediate *plus* these two lists simultaneously was the
+        # direct cause of an OOM-killed container (see parallel_map()'s docstring).
+        tokenized_corpus: list[list[str]] = []
+        matched_terms: list[list[str]] = []
+        for cleaned, matched in parallel_map(
+            partial(_clean_and_match, lexicon_terms=lexicon_terms),
+            corpus_texts,
+            desc="bm25: cleaning+tokenizing+matching corpus",
+            on_progress=_on_progress,
+        ):
+            # sys.intern(): the ~745k-document corpus has enormous token repetition (common
+            # words like "model"/"patient"/"study" appear in most documents) -- interning makes
+            # every repeated occurrence a pointer to one shared string object instead of a fresh
+            # ~50+-byte object per occurrence. `str.split()` always creates new string objects
+            # (unlike compile-time literals, CPython doesn't auto-intern runtime substrings), so
+            # this needs to be explicit. A real, measured contributor to the OOM incidents this
+            # module's other comments describe -- not a micro-optimization added speculatively.
+            tokenized_corpus.append([sys.intern(tok) for tok in cleaned.split()])
+            matched_terms.append(matched)
+
+        print(f"bm25: indexing {len(tokenized_corpus)} documents...")
+        t0 = time.monotonic()
         bm25 = BM25Okapi(tokenized_corpus)
+        print(f"bm25: indexed in {time.monotonic() - t0:.1f}s. scoring against positive lexicon...")
+
+        t0 = time.monotonic()
         query_tokens = clean_text(" ".join(lexicon_terms)).split()
         scores = bm25.get_scores(query_tokens)
+        print(f"bm25: positive-lexicon scoring done in {time.monotonic() - t0:.1f}s.")
         if exclusionary_terms:
+            t0 = time.monotonic()
+            print("bm25: scoring against exclusionary lexicon...")
             exclusionary_query_tokens = clean_text(" ".join(exclusionary_terms)).split()
             exclusionary_scores = bm25.get_scores(exclusionary_query_tokens)
             scores = scores - exclusionary_weight * exclusionary_scores
+            print(f"bm25: exclusionary-lexicon scoring done in {time.monotonic() - t0:.1f}s.")
+        if checkpoint_path:
+            _write_checkpoint(checkpoint_path, scorer=self.name, stage="done", processed=n, total=n, pct_complete=100.0)
         print("bm25: done.")
         return list(zip((float(s) for s in scores), matched_terms))
 
@@ -144,12 +240,42 @@ class TfidfCosineScorer:
         lexicon_terms: list[str],
         exclusionary_terms: list[str] | None = None,
         exclusionary_weight: float = 1.0,
+        checkpoint_path: Path | None = None,
     ) -> list[ScoredResult]:
-        cleaned_corpus = []
-        matched_terms = []
-        for text in tqdm(corpus_texts, desc="tfidf-cosine: cleaning corpus", unit="doc"):
-            cleaned_corpus.append(clean_text(text))
-            matched_terms.append(_find_matched_terms(text, lexicon_terms))
+        n = len(corpus_texts)
+        started = time.monotonic()
+
+        def _on_progress(processed: int, total: int) -> None:
+            elapsed = time.monotonic() - started
+            rate = processed / elapsed if elapsed > 0 else 0.0
+            eta = (total - processed) / rate if rate > 0 else 0.0
+            print(
+                f"tfidf-cosine: {processed}/{total} docs cleaned+matched ({processed / total * 100:.1f}%) -- "
+                f"{elapsed:.0f}s elapsed, ~{eta:.0f}s remaining, {rate:.1f} docs/sec"
+            )
+            if checkpoint_path:
+                _write_checkpoint(
+                    checkpoint_path,
+                    scorer=self.name,
+                    stage="cleaning",
+                    processed=processed,
+                    total=total,
+                    pct_complete=round(processed / total * 100, 1),
+                    elapsed_seconds=round(elapsed, 1),
+                )
+
+        # See Bm25Scorer.score_corpus for why this consumes the generator directly rather than
+        # materializing a combined (cleaned, matched) intermediate for the whole corpus.
+        cleaned_corpus: list[str] = []
+        matched_terms: list[list[str]] = []
+        for cleaned, matched in parallel_map(
+            partial(_clean_and_match, lexicon_terms=lexicon_terms),
+            corpus_texts,
+            desc="tfidf-cosine: cleaning+matching corpus",
+            on_progress=_on_progress,
+        ):
+            cleaned_corpus.append(cleaned)
+            matched_terms.append(matched)
 
         pseudo_query = clean_text(" ".join(lexicon_terms))
         extra_docs = [pseudo_query]
