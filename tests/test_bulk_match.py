@@ -71,6 +71,21 @@ def test_core_result_to_raw_record_handles_missing_optional_fields():
     assert record.fulltext_available is False
 
 
+def test_core_result_to_raw_record_filters_null_entries_in_keyword_and_pubtype_lists():
+    # Confirmed live in the real 2000-2026 bulk fetch: some records have a bare `null` inside
+    # keywordList/pubTypeList, which used to raise a Pydantic ValidationError and abort the whole
+    # load rather than just dropping the one bad list element.
+    result = dict(
+        SAMPLE_RESULT,
+        keywordList={"keyword": [None, "Deep Learning", None]},
+        pubTypeList={"pubType": ["Journal Article", None]},
+    )
+    record = core_result_to_raw_record(result, source_name="test", source_file="test.jsonl")
+
+    assert record.keywords_author == ["Deep Learning"]
+    assert record.pub_types == ["Journal Article"]
+
+
 def test_range_query_builds_expected_date_bounded_query():
     query = _range_query(2000, 2026)
     assert query == '("artificial intelligence" OR "machine learning") AND (FIRST_PDATE:[2000-01-01 TO 2026-12-31])'

@@ -6,6 +6,9 @@ from dome_triage.curate.state import CurationSession, materialize_events
 
 
 def _write_dataset(path):
+    # label/label_confidence/pmcid default to neutral values (unlabeled/unscored/no pmcid) so
+    # none of them trip the include_already_labeled/require_pmcid filters below -- existing tests
+    # that don't care about those toggles see the same 3-record queue as before.
     df = pd.DataFrame(
         {
             "record_id": ["rec1", "rec2", "rec3"],
@@ -13,6 +16,9 @@ def _write_dataset(path):
             "abstract": ["Abstract one.", "Abstract two.", "Abstract three."],
             "journal": ["J1", "J2", "J3"],
             "year": ["2020", "2021", "2022"],
+            "label": ["unlabeled", "unlabeled", "unlabeled"],
+            "label_confidence": ["unscored", "unscored", "unscored"],
+            "pmcid": ["", "", ""],
         }
     )
     df.to_csv(path, index=False)
@@ -99,6 +105,61 @@ def test_record_decision_allows_undeterminable(tmp_path):
 
     events = pd.read_csv(events_path)
     assert events.iloc[0]["decision"] == "undeterminable"
+
+
+def _write_dataset_with_mixed_trust(path):
+    df = pd.DataFrame(
+        {
+            "record_id": ["rec1", "rec2", "rec3", "rec4"],
+            "title": ["Trusted positive", "Trusted negative", "Heuristic positive", "Unlabeled"],
+            "abstract": ["a", "b", "c", "d"],
+            "journal": ["J1", "J2", "J3", "J4"],
+            "year": ["2020", "2021", "2022", "2023"],
+            "label": ["positive", "negative", "positive", "unlabeled"],
+            "label_confidence": ["human_curated", "registry_confirmed", "heuristic_candidate", "unscored"],
+            "pmcid": ["PMC1", "", "PMC3", ""],
+        }
+    )
+    df.to_csv(path, index=False)
+    return path
+
+
+def test_trusted_prior_labeled_records_excluded_from_queue_by_default(tmp_path):
+    # rec1 (human_curated) and rec2 (registry_confirmed) are already-settled ground truth from a
+    # prior curation round -- they must NOT flood a fresh queue. rec3 (heuristic_candidate) and
+    # rec4 (unlabeled) still need review.
+    dataset_path = _write_dataset_with_mixed_trust(tmp_path / "canonical_dataset.csv")
+    session = CurationSession(dataset_path=dataset_path, events_path=tmp_path / "events.csv", curator="alice")
+
+    assert session.total() == 2
+    ids_in_queue = set(session.queue)
+    assert ids_in_queue == {"rec3", "rec4"}
+
+
+def test_include_already_labeled_toggle_restores_full_queue(tmp_path):
+    dataset_path = _write_dataset_with_mixed_trust(tmp_path / "canonical_dataset.csv")
+    session = CurationSession(
+        dataset_path=dataset_path,
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+        include_already_labeled=True,
+    )
+
+    assert session.total() == 4
+    assert set(session.queue) == {"rec1", "rec2", "rec3", "rec4"}
+
+
+def test_require_pmcid_filters_queue_to_records_with_a_pmcid(tmp_path):
+    dataset_path = _write_dataset_with_mixed_trust(tmp_path / "canonical_dataset.csv")
+    session = CurationSession(
+        dataset_path=dataset_path,
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+        include_already_labeled=True,  # isolate the pmcid filter from the trust filter
+        require_pmcid=True,
+    )
+
+    assert set(session.queue) == {"rec1", "rec3"}  # only these two have a pmcid
 
 
 def _write_canonical_dataset_with_label(path, label="positive", label_confidence="human_curated"):

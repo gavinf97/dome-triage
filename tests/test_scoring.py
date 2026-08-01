@@ -71,6 +71,49 @@ def test_weighted_sum_scorer_subtracts_exclusionary_matches():
     assert matched_with_penalty == matched  # exclusionary terms never appear in the matched list
 
 
+def test_weighted_sum_scorer_uses_real_exclusionary_weights_when_given():
+    weights = {t: 1.0 for t in LEXICON_TERMS}
+    exclusionary_weights = {"genomic data": 0.05}  # a small, realistic discriminative_score-scale weight
+    scorer = WeightedSumScorer(weights, exclusionary_weights)
+
+    without_penalty, _ = scorer.score_corpus([RELEVANT_DOC], LEXICON_TERMS)[0]
+    with_penalty, _ = scorer.score_corpus(
+        [RELEVANT_DOC], LEXICON_TERMS, exclusionary_terms=EXCLUSIONARY_TERMS, exclusionary_weight=1.0
+    )[0]
+
+    # Uses the real 0.05 weight, not an unweighted count of 1.0 -- this is the fix: a live
+    # bake-off run showed the unweighted-count fallback (penalty=1.0 per match) swamping the
+    # positive sum, since real discriminative_score values are ~0.0001-0.02 in magnitude,
+    # collapsing AUROC from 0.700 to 0.454 (worse than random).
+    assert with_penalty == without_penalty - 0.05
+
+
+def test_weighted_sum_scorer_exclusionary_penalty_is_sign_safe():
+    # A term manually reclassified from the positive pile (see curate/term_review_state.py)
+    # keeps its originally-snapshotted *positive* discriminative_score even though it's now an
+    # exclusionary term -- the penalty must still SUBTRACT (never flip sign and reward a match).
+    weights = {t: 1.0 for t in LEXICON_TERMS}
+    exclusionary_weights = {"genomic data": 0.05}  # positive-signed, as a reclassified term would be
+    scorer = WeightedSumScorer(weights, exclusionary_weights)
+
+    without_penalty, _ = scorer.score_corpus([RELEVANT_DOC], LEXICON_TERMS)[0]
+    with_penalty, _ = scorer.score_corpus(
+        [RELEVANT_DOC], LEXICON_TERMS, exclusionary_terms=EXCLUSIONARY_TERMS, exclusionary_weight=1.0
+    )[0]
+
+    assert with_penalty < without_penalty
+
+
+def test_weighted_sum_scorer_falls_back_to_unit_weight_for_unknown_exclusionary_terms():
+    weights = {t: 1.0 for t in LEXICON_TERMS}
+    scorer = WeightedSumScorer(weights, exclusionary_term_weights={})  # no weight known for this term
+    score, _ = scorer.score_corpus(
+        [RELEVANT_DOC], LEXICON_TERMS, exclusionary_terms=EXCLUSIONARY_TERMS, exclusionary_weight=1.0
+    )[0]
+    without_penalty, _ = scorer.score_corpus([RELEVANT_DOC], LEXICON_TERMS)[0]
+    assert score == without_penalty - 1.0
+
+
 def test_bm25_scorer_exclusionary_terms_reduce_score():
     scorer = Bm25Scorer()
     corpus = [RELEVANT_DOC, IRRELEVANT_DOC, *FILLER_DOCS]

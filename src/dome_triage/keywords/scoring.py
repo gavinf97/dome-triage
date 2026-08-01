@@ -43,15 +43,27 @@ class WeightedSumScorer:
     """Sum of each present lexicon term's weight (typically its TF-IDF discriminative_score).
     Fully transparent and cheap -- the simplest baseline to sanity-check the others against.
 
-    If `exclusionary_terms` are given, subtracts `exclusionary_weight` per matched exclusionary
-    term (unweighted count, not per-term weighted -- this scorer's constructor only carries
-    weights for the positive lexicon; kept minimal since weighted-sum is the weaker scorer
-    empirically, see ROADMAP.md's bake-off result)."""
+    If `exclusionary_terms` are given, subtracts `exclusionary_weight * (sum of each matched
+    exclusionary term's own weight)`, using `exclusionary_term_weights` if supplied. **Do not
+    fall back to an unweighted match count here** -- a live bake-off run confirmed this in
+    practice: with an unweighted count (1.0 per match, the original implementation), AUROC
+    collapsed from 0.700 to 0.454 (worse than random) because a single exclusionary match (e.g.
+    the word "forest") swamped an entire paper's positive sum, which is typically ~0.0001-0.02 in
+    magnitude (real discriminative_score values are tiny) -- a ~50-100x scale mismatch per match.
+    Exclusionary weights are `abs()`-ed before use: a term manually reclassified from the positive
+    pile (see curate/term_review_state.py) keeps its originally-snapshotted *positive*
+    discriminative_score, which would otherwise flip the subtraction's sign and *reward* a match
+    instead of penalizing it."""
 
     name = "weighted-sum"
 
-    def __init__(self, term_weights: dict[str, float]):
+    def __init__(
+        self,
+        term_weights: dict[str, float],
+        exclusionary_term_weights: dict[str, float] | None = None,
+    ):
         self.term_weights = term_weights
+        self.exclusionary_term_weights = exclusionary_term_weights or {}
 
     def score_corpus(
         self,
@@ -66,7 +78,10 @@ class WeightedSumScorer:
             total = sum(self.term_weights.get(term, 0.0) for term in matched)
             if exclusionary_terms:
                 matched_exclusionary = _find_matched_terms(text, exclusionary_terms)
-                total -= exclusionary_weight * len(matched_exclusionary)
+                exclusionary_total = sum(
+                    abs(self.exclusionary_term_weights.get(term, 1.0)) for term in matched_exclusionary
+                )
+                total -= exclusionary_weight * exclusionary_total
             results.append((total, matched))
         return results
 

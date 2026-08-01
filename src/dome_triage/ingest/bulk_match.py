@@ -112,11 +112,19 @@ def core_result_to_raw_record(
         authors=result.get("authorString") or None,
         year=year,
         mesh_headings=extract_mesh_headings(result),
-        pub_types=(result.get("pubTypeList") or {}).get("pubType") or [],
+        pub_types=_non_null_strings((result.get("pubTypeList") or {}).get("pubType")),
         is_open_access=(is_open_access == "Y") if is_open_access in ("Y", "N") else None,
-        keywords_author=(result.get("keywordList") or {}).get("keyword") or [],
+        keywords_author=_non_null_strings((result.get("keywordList") or {}).get("keyword")),
         fulltext_available=bool(result.get("inEPMC") == "Y" or result.get("inPMC") == "Y"),
     )
+
+
+def _non_null_strings(values: list | None) -> list[str]:
+    """Real Europe PMC records occasionally have a null entry inside pubTypeList/keywordList
+    (confirmed live across the 2000-2026 bulk fetch, not just a theoretical edge case) --
+    RawRecord's pub_types/keywords_author are `list[str]`, so a bare null entry fails Pydantic
+    validation. Filter rather than reject the whole record over one bad list element."""
+    return [v for v in (values or []) if isinstance(v, str)]
 
 
 def load_bulk_match_year(jsonl_path: Path, year: int) -> list[RawRecord]:

@@ -15,21 +15,24 @@ def get_config() -> PipelineConfig:
     return PipelineConfig()
 
 
-def get_session() -> CurationSession:
+def get_session(include_already_labeled: bool = False, require_pmcid: bool = False) -> CurationSession:
+    """Like get_term_review_session, the cache key must include the two toggles (not just the
+    curator) -- they redefine which records are in the reviewable queue at all, not just how it's
+    sorted/filtered client-side, so switching either must reconstruct fresh from disk."""
     cfg = get_config()
     curator = st.session_state.get("curator_name") or cfg.pipeline["curation"]["default_curator"]
+    key = (curator, include_already_labeled, require_pmcid)
 
-    needs_new_session = (
-        "curation_session" not in st.session_state
-        or st.session_state.get("_curator_for_session") != curator
-    )
+    needs_new_session = st.session_state.get("_curation_session_key") != key
     if needs_new_session:
         st.session_state["curation_session"] = CurationSession(
             dataset_path=cfg.path("canonical_dataset"),
             events_path=resolve_path(cfg.pipeline["curation"]["events_log"]),
             curator=curator,
+            include_already_labeled=include_already_labeled,
+            require_pmcid=require_pmcid,
         )
-        st.session_state["_curator_for_session"] = curator
+        st.session_state["_curation_session_key"] = key
     return st.session_state["curation_session"]
 
 

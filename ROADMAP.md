@@ -56,6 +56,11 @@ Docker, README, AGENTS.md, CC BY 4.0 license, GitHub remote, CLI skeleton, confi
   (see "Undeterminable handling policy" below), MeSH headings shown for context, a
   config-driven structured feature checklist (`configs/curation_features.yaml` — a living
   checklist, not a fixed schema), and a conflict-resolution page (`src/dome_triage/curate/`).
+  **Queue now excludes already-trusted prior labels by default** (`label_confidence in
+  {human_curated, registry_confirmed}`, `curate/state.py::CurationSession`'s
+  `include_already_labeled`/`require_pmcid` toggles) — before this fix the queue had no such
+  filter at all, so a fresh session would have presented every already-curated record (~4,320,
+  from `DOME_Top_Curate` etc.) for review alongside genuinely new bulk-matched candidates.
 - TF-IDF + KeyBERT keyword extraction producing a scored keyword lexicon, seeded from
   `MLit-Triage-Nextflow/categorized_terms.csv`, with a `lexicon-stats` threshold tool and a real
   human review checkpoint (`src/dome_triage/keywords/`, `curate/term_review_state.py`,

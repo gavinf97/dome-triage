@@ -29,15 +29,25 @@ def backup_file(path: Path) -> None:
         shutil.copy2(path, backup_path)
 
 
+# A record already trusted at this confidence tier (from a prior curation round outside this
+# session -- DOME_Top_Curate, the DOME registry API, etc.) is settled ground truth, not something
+# that needs a fresh decision -- mirrors materialize_events' own "contradicts_trusted_prior" tier
+# pairing below.
+_TRUSTED_LABEL_CONFIDENCE = ("human_curated", "registry_confirmed")
+
+
 @dataclass
 class CurationSession:
     dataset_path: Path
     events_path: Path
     curator: str = "unknown"
+    include_already_labeled: bool = False
+    require_pmcid: bool = False
 
     dataset: pd.DataFrame = field(init=False, repr=False)
     events: pd.DataFrame = field(init=False, repr=False)
     queue: list = field(init=False, repr=False)
+    _reviewable_ids: set = field(init=False, repr=False)
     _position: int = field(init=False, default=0)
 
     def __post_init__(self) -> None:
@@ -48,11 +58,24 @@ class CurationSession:
             else pd.DataFrame(columns=EVENT_COLUMNS)
         )
         decided = set(self.events["record_id"]) if not self.events.empty else set()
-        self.queue = [rid for rid in self.dataset["record_id"] if rid not in decided]
+
+        reviewable = self.dataset
+        if not self.include_already_labeled:
+            trusted_mask = self.dataset["label_confidence"].isin(_TRUSTED_LABEL_CONFIDENCE) & self.dataset[
+                "label"
+            ].isin(["positive", "negative"])
+            reviewable = reviewable[~trusted_mask]
+        if self.require_pmcid:
+            reviewable = reviewable[reviewable["pmcid"].notna() & (reviewable["pmcid"] != "")]
+
+        self._reviewable_ids = set(reviewable["record_id"])
+        self.queue = [
+            rid for rid in self.dataset["record_id"] if rid in self._reviewable_ids and rid not in decided
+        ]
         self._position = 0
 
     def total(self) -> int:
-        return len(self.dataset)
+        return len(self._reviewable_ids)
 
     def remaining(self) -> int:
         return len(self.queue) - self._position

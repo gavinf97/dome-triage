@@ -25,7 +25,20 @@ if not st.session_state.get("curator_name"):
     st.warning("Set your curator name on the Home page first.")
     st.stop()
 
-session = get_session()
+toggle_col1, toggle_col2 = st.columns(2)
+include_already_labeled = toggle_col1.checkbox(
+    "Include already-curated records (redo / re-review)",
+    value=False,
+    help="Off by default: records already trusted from a prior curation round "
+    "(label_confidence human_curated or registry_confirmed) are excluded from the queue -- "
+    "they're settled ground truth, not new. Turn on to deliberately re-review them anyway.",
+)
+require_pmcid = toggle_col2.checkbox(
+    "Only show records with full text available (has PMCID)",
+    value=False,
+)
+
+session = get_session(include_already_labeled=include_already_labeled, require_pmcid=require_pmcid)
 record = session.current_record()
 
 if record is None:

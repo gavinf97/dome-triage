@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+from tqdm import tqdm
 
 from dome_triage.config import PipelineConfig, resolve_path
 from dome_triage.curate.state import backup_file
@@ -397,9 +398,12 @@ def step_keywords_lexicon_stats(cfg: PipelineConfig) -> None:
 
 def step_keywords_scoring_bakeoff(cfg: PipelineConfig, exclusionary_weight: float = 1.0) -> None:
     """Validates every MatchScorer against the already-known-labeled records in
-    canonical_dataset.csv before any scorer is trusted to rank the unlabeled bulk pool. If
-    keyword_lexicon_exclusionary.csv exists (from `keywords materialize-lexicon`), the bake-off
-    reflects the actual production approach (positive lexicon minus exclusionary penalty)."""
+    canonical_dataset.csv, TWICE per scorer: once using only the approved positive lexicon
+    (condition "positive_lexicon_only"), and -- if keyword_lexicon_exclusionary.csv exists --
+    again with the exclusionary lexicon's penalty applied too (condition
+    "positive_plus_exclusionary_lexicon"). Two conditions side by side is a genuine before/after
+    comparison of whether the exclusionary lexicon actually improves ranking quality, not just an
+    assumption that it does."""
     started_at = time.monotonic()
     lexicon_path = cfg.path("processed_dir") / "keyword_lexicon.csv"
     if not lexicon_path.exists():
@@ -411,27 +415,42 @@ def step_keywords_scoring_bakeoff(cfg: PipelineConfig, exclusionary_weight: floa
 
     exclusionary_path = resolve_path(cfg.pipeline["keywords"]["exclusionary_lexicon"])
     exclusionary_terms: list[str] = []
+    exclusionary_term_weights: dict[str, float] = {}
     if exclusionary_path.exists():
         exclusionary_df = pd.read_csv(exclusionary_path)
-        exclusionary_terms, _ = load_lexicon_terms_and_weights(exclusionary_df)
+        exclusionary_terms, exclusionary_term_weights = load_lexicon_terms_and_weights(exclusionary_df)
 
     dataset = pd.read_csv(cfg.path("canonical_dataset"), dtype=str)
     labeled = dataset[dataset["label"].isin(["positive", "negative"])].copy()
     texts = (labeled["title"].fillna("") + ". " + labeled["abstract"].fillna("")).tolist()
     true_labels = (labeled["label"] == "positive").astype(int).tolist()
+    n_positive = sum(true_labels)
+    n_negative = len(true_labels) - n_positive
 
-    scorers = {
-        "weighted-sum": WeightedSumScorer(term_weights),
-        **{name: cls() for name, cls in SCORERS.items() if name != "weighted-sum"},
-    }
-    report = run_bakeoff(
-        scorers,
-        texts,
-        true_labels,
-        lexicon_terms,
-        exclusionary_terms=exclusionary_terms or None,
-        exclusionary_weight=exclusionary_weight,
-    )
+    def _build_scorers() -> dict:
+        return {
+            "weighted-sum": WeightedSumScorer(term_weights, exclusionary_term_weights),
+            **{name: cls() for name, cls in SCORERS.items() if name != "weighted-sum"},
+        }
+
+    reports = [
+        run_bakeoff(
+            _build_scorers(), texts, true_labels, lexicon_terms, condition_label="positive_lexicon_only"
+        )
+    ]
+    if exclusionary_terms:
+        reports.append(
+            run_bakeoff(
+                _build_scorers(),
+                texts,
+                true_labels,
+                lexicon_terms,
+                exclusionary_terms=exclusionary_terms,
+                exclusionary_weight=exclusionary_weight,
+                condition_label="positive_plus_exclusionary_lexicon",
+            )
+        )
+    report = pd.concat(reports, ignore_index=True).sort_values(["scorer", "condition"]).reset_index(drop=True)
 
     output_path = cfg.path("processed_dir") / "scoring_bakeoff_report.csv"
     report.to_csv(output_path, index=False)
@@ -441,8 +460,18 @@ def step_keywords_scoring_bakeoff(cfg: PipelineConfig, exclusionary_weight: floa
         "keywords.scoring-bakeoff",
         inputs=[lexicon_path, cfg.path("canonical_dataset")] + ([exclusionary_path] if exclusionary_terms else []),
         outputs=[output_path],
-        params={"exclusionary_weight": exclusionary_weight, "n_exclusionary_terms": len(exclusionary_terms)},
-        notes=f"validated against {len(labeled)} already-labeled records",
+        params={
+            "exclusionary_weight": exclusionary_weight,
+            "n_exclusionary_terms": len(exclusionary_terms),
+            "conditions_run": sorted(report["condition"].unique().tolist()),
+        },
+        notes=f"validated against {len(labeled)} already-labeled records "
+        f"({n_positive} positive / {n_negative} negative) -- "
+        + (
+            "2 conditions (with/without exclusionary lexicon)"
+            if exclusionary_terms
+            else "1 condition (no keyword_lexicon_exclusionary.csv found)"
+        ),
         started_at=started_at,
     )
 
@@ -498,21 +527,36 @@ def step_bulk_match_build_candidates(cfg: PipelineConfig) -> None:
     """Consolidates every *completed* per-year JSONL cache (still one file per year on disk even
     when `bulk-match fetch --year-from --year-to` fetched a whole range in a single invocation --
     that's an internal checkpointing detail, not something the human triggers) into one
-    deduplicated candidate pool, keyed on pmcid. Rerun anytime after fetching more years to pick
-    up newly completed ones."""
+    deduplicated candidate pool, keyed on **pmid**, not pmcid: PMCID is only assigned to records
+    with full text deposited in PMC, while PMID exists for essentially every Europe PMC/MEDLINE
+    entry -- deduping on pmcid would leave true duplicates in for any record without one (likely
+    the majority of the bulk-matched pool, most of which won't be open-access full text). Rerun
+    anytime after fetching more years to pick up newly completed ones.
+
+    Processes one year's JSONL at a time -- converting each year straight to a DataFrame and
+    discarding its RawRecord/Pydantic objects before loading the next year, deduplicating the
+    running frame incrementally -- rather than materializing every year's Pydantic objects
+    simultaneously. Confirmed necessary, not just theoretical: an earlier all-at-once version got
+    OOM-killed (exit 137) on the real 2000-2026 fetch (~828k records, 5.3GB of JSONL) on a 15GB
+    host; Pydantic model instances carry substantially more memory overhead per record than a
+    DataFrame row."""
     started_at = time.monotonic()
     checkpoint_dir = cfg.path("interim_dir") / "bulk_match_cache"
-    all_records = []
     completed_years = []
-    for done_marker in sorted(checkpoint_dir.glob("bulk_match_*.done")):
+    done_markers = sorted(checkpoint_dir.glob("bulk_match_*.done"))
+    combined_df: pd.DataFrame | None = None
+    for done_marker in tqdm(done_markers, desc="Loading + deduplicating per-year caches", unit="year"):
         year = int(done_marker.stem.split("_")[-1])
         jsonl_path = checkpoint_dir / f"bulk_match_{year}.jsonl"
-        all_records.extend(load_bulk_match_year(jsonl_path, year))
+        year_df = raw_records_to_dataframe(load_bulk_match_year(jsonl_path, year))
+        running_total = len(year_df) if combined_df is None else len(combined_df) + len(year_df)
+        print(f"  {year}: {len(year_df)} records (running total before dedup: {running_total})")
+        combined_df = year_df if combined_df is None else pd.concat([combined_df, year_df], ignore_index=True)
+        combined_df = combined_df.sort_values("pmid").drop_duplicates(subset=["pmid"], keep="first")
         completed_years.append(year)
 
-    df = raw_records_to_dataframe(all_records)
-    if not df.empty:
-        df = df.sort_values("pmcid").drop_duplicates(subset=["pmcid"], keep="first")
+    df = combined_df if combined_df is not None else raw_records_to_dataframe([])
+    print(f"Deduplicated total: {len(df)} unique records (by pmid)")
 
     output_path = cfg.sampling_path("bulk_candidates")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -528,10 +572,66 @@ def step_bulk_match_build_candidates(cfg: PipelineConfig) -> None:
     )
 
 
-def _build_scorer(scorer_name: str, term_weights: dict[str, float]):
+def _build_scorer(scorer_name: str, term_weights: dict[str, float], exclusionary_term_weights: dict[str, float]):
     if scorer_name == "weighted-sum":
-        return WeightedSumScorer(term_weights)
+        return WeightedSumScorer(term_weights, exclusionary_term_weights)
     return SCORERS[scorer_name]()
+
+
+def _lookup_youden_threshold(bakeoff_report_path: Path, scorer_name: str, condition: str) -> float | None:
+    """Reuses the threshold Step 11's bake-off already validated for this exact scorer+condition,
+    rather than recomputing one -- keeps Step 12's positive/negative classification consistent
+    with what was empirically checked, not a fresh guess. Returns None (no classification column
+    added for this scorer) if the report doesn't exist yet or has no matching row -- run
+    `keywords scoring-bakeoff` first to get one."""
+    if not bakeoff_report_path.exists():
+        return None
+    report = pd.read_csv(bakeoff_report_path)
+    match = report[(report["scorer"] == scorer_name) & (report["condition"] == condition)]
+    if match.empty or pd.isna(match.iloc[0]["threshold_youden"]):
+        return None
+    return float(match.iloc[0]["threshold_youden"])
+
+
+def _build_existing_label_lookup(canonical_df: pd.DataFrame) -> dict[str, tuple[str, str]]:
+    """Maps every pmcid/pmid/doi in the canonical dataset to that record's (label,
+    label_confidence). Small (~4k rows), so a plain loop is fine here -- contrast
+    `_annotate_already_curated` below, which is vectorized because it runs against the
+    700k+-row bulk candidate pool."""
+    lookup: dict[str, tuple[str, str]] = {}
+    for id_field in ("pmcid", "pmid", "doi"):
+        subset = canonical_df[canonical_df[id_field].notna() & (canonical_df[id_field] != "")]
+        for value, label, confidence in zip(subset[id_field], subset["label"], subset["label_confidence"]):
+            lookup.setdefault(value, (label, confidence))
+    return lookup
+
+
+def _annotate_already_curated(candidates: pd.DataFrame, lookup: dict[str, tuple[str, str]]) -> pd.DataFrame:
+    """Adds `already_curated`/`existing_label`/`existing_label_confidence` -- whether this bulk
+    candidate already exists in canonical_dataset.csv from a prior curation round (by pmcid, else
+    pmid, else doi), and if so what it was already decided as. Lets a human reviewing the
+    stratified sample later (or `curate/state.py::CurationSession`'s `include_already_labeled`
+    toggle) see and choose to skip or deliberately redo already-curated overlaps, rather than
+    silently either re-reviewing or hiding them. Vectorized (three dict `.map()` calls, not a
+    per-row Python loop) -- this runs against the full 700k+-row bulk pool."""
+    label_lookup = {k: v[0] for k, v in lookup.items()}
+    confidence_lookup = {k: v[1] for k, v in lookup.items()}
+
+    existing_label = (
+        candidates["pmcid"].map(label_lookup).fillna(candidates["pmid"].map(label_lookup)).fillna(
+            candidates["doi"].map(label_lookup)
+        )
+    )
+    existing_confidence = (
+        candidates["pmcid"].map(confidence_lookup).fillna(candidates["pmid"].map(confidence_lookup)).fillna(
+            candidates["doi"].map(confidence_lookup)
+        )
+    )
+
+    candidates["already_curated"] = existing_label.notna()
+    candidates["existing_label"] = existing_label.fillna("")
+    candidates["existing_label_confidence"] = existing_confidence.fillna("")
+    return candidates
 
 
 def step_keywords_score_bulk_match(
@@ -540,7 +640,15 @@ def step_keywords_score_bulk_match(
     """`scorer_name` is one of SCORERS' keys, or "all" to keep every scorer as a separate
     match_score__<name> column for later comparison. If keyword_lexicon_exclusionary.csv exists
     (from `keywords materialize-lexicon`), its terms are subtracted as a penalty, weighted by
-    `exclusionary_weight`."""
+    `exclusionary_weight`.
+
+    Also adds, once regardless of how many scorers run: `has_pmcid` (full text available in PMC
+    or not) and `already_curated`/`existing_label`/`existing_label_confidence` (does this
+    candidate already exist in canonical_dataset.csv from a prior curation round -- see
+    `_annotate_already_curated`). And per scorer, `match_classification__<name>`
+    (positive/negative) if `scoring_bakeoff_report.csv` has a validated Youden threshold for that
+    exact scorer + condition (positive-only vs positive-plus-exclusionary, auto-detected from
+    whether an exclusionary lexicon was found) -- see `_lookup_youden_threshold`."""
     started_at = time.monotonic()
     lexicon_path = cfg.path("processed_dir") / "keyword_lexicon.csv"
     lexicon_df = pd.read_csv(lexicon_path)
@@ -548,17 +656,33 @@ def step_keywords_score_bulk_match(
 
     exclusionary_path = resolve_path(cfg.pipeline["keywords"]["exclusionary_lexicon"])
     exclusionary_terms: list[str] = []
+    exclusionary_term_weights: dict[str, float] = {}
     if exclusionary_path.exists():
         exclusionary_df = pd.read_csv(exclusionary_path)
-        exclusionary_terms, _ = load_lexicon_terms_and_weights(exclusionary_df)
+        exclusionary_terms, exclusionary_term_weights = load_lexicon_terms_and_weights(exclusionary_df)
+    condition = "positive_plus_exclusionary_lexicon" if exclusionary_terms else "positive_lexicon_only"
 
     candidates_path = cfg.sampling_path("bulk_candidates")
     candidates = pd.read_csv(candidates_path, dtype=str)
     texts = (candidates["title"].fillna("") + ". " + candidates["abstract"].fillna("")).tolist()
 
+    candidates["has_pmcid"] = candidates["pmcid"].notna() & (candidates["pmcid"] != "")
+
+    canonical_path = cfg.path("canonical_dataset")
+    if canonical_path.exists():
+        existing_lookup = _build_existing_label_lookup(pd.read_csv(canonical_path, dtype=str))
+        candidates = _annotate_already_curated(candidates, existing_lookup)
+    else:
+        candidates["already_curated"] = False
+        candidates["existing_label"] = ""
+        candidates["existing_label_confidence"] = ""
+
+    bakeoff_report_path = cfg.path("processed_dir") / "scoring_bakeoff_report.csv"
+    thresholds_used: dict[str, float] = {}
+
     names_to_run = list(SCORERS) if scorer_name == "all" else [scorer_name]
     for name in names_to_run:
-        scorer = _build_scorer(name, term_weights)
+        scorer = _build_scorer(name, term_weights, exclusionary_term_weights)
         scored = scorer.score_corpus(
             texts,
             lexicon_terms,
@@ -568,18 +692,40 @@ def step_keywords_score_bulk_match(
         candidates[f"match_score__{name}"] = [s for s, _ in scored]
         candidates[f"matched_terms__{name}"] = [";".join(terms) for _, terms in scored]
 
+        threshold = _lookup_youden_threshold(bakeoff_report_path, name, condition)
+        if threshold is not None:
+            thresholds_used[name] = threshold
+            candidates[f"match_classification__{name}"] = [
+                "positive" if s >= threshold else "negative" for s in candidates[f"match_score__{name}"]
+            ]
+
     output_path = cfg.sampling_path("bulk_candidates_scored")
     candidates.to_csv(output_path, index=False)
 
+    n_already_curated = int(candidates["already_curated"].sum())
+    n_has_pmcid = int(candidates["has_pmcid"].sum())
+
     finish_step(
         "keywords.score-bulk-match",
-        inputs=[lexicon_path, candidates_path] + ([exclusionary_path] if exclusionary_terms else []),
+        inputs=[lexicon_path, candidates_path]
+        + ([exclusionary_path] if exclusionary_terms else [])
+        + ([bakeoff_report_path] if thresholds_used else []),
         outputs=[output_path],
         params={
             "scorer": scorer_name,
             "exclusionary_weight": exclusionary_weight,
             "n_exclusionary_terms": len(exclusionary_terms),
+            "condition": condition,
+            "thresholds_used": thresholds_used,
         },
+        notes=f"{len(candidates)} candidates scored; {n_already_curated} already curated in "
+        f"canonical_dataset.csv ({n_already_curated / len(candidates) * 100:.1f}%); "
+        f"{n_has_pmcid} have a PMCID ({n_has_pmcid / len(candidates) * 100:.1f}%)"
+        + (
+            f"; classified at threshold(s) {thresholds_used} (from Step 11's bake-off)"
+            if thresholds_used
+            else "; no classification column added -- run `keywords scoring-bakeoff` first for one"
+        ),
         started_at=started_at,
     )
 

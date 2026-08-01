@@ -348,23 +348,27 @@ overlap is expected — papers mentioning both). Row counts non-trivial for rece
 for early-2000s years (real — AI/ML terminology was far less common in abstracts back then).
 
 **Log:**
-- [ ] Run on: __________
-- **AI-mentioning: __________ | ML-mentioning: __________ | Combined (deduplicated): __________**
+- [x] Run on: 31st July 2026 (2000-2026, one call, ~90 minutes)
+- **AI-mentioning: 457,109 | ML-mentioning: 541,632 | Combined (deduplicated): 827,890**
   (also in `data/processed/bulk_match_summary.csv`, dated)
-- Decision/notes: __________
+- Decision/notes: Logged in file results. `page_size: 1000` bump held up fine across the full
+  multi-decade run — no EPMC errors.
 
 ---
 
 ## Step 10 — Build bulk candidate pool
 
 **What's happening / why:** Consolidates every year's checkpoint file from Step 9 into one
-deduplicated candidate pool, keyed on `pmcid`. **Still needed even though Step 9 is now one
-command**, not per-year consolidation you manually trigger — Step 9 still writes one JSONL file
-per year internally (for checkpointing/resumability), so something still has to merge those files
-into a single pool before scoring/sampling can use it. This step is that merge; nothing about it
-changed. It does not need to separately dedupe "AI vs ML" — Step 9's combined query already
-returns each matching record exactly once, so any duplication this step removes is purely
-cross-year (e.g. a record whose date metadata put it on a year boundary).
+deduplicated candidate pool, keyed on **`pmid`, not `pmcid`** — PMCID is only assigned to records
+with full text deposited in PMC, while PMID exists for essentially every Europe PMC/MEDLINE entry,
+so deduping on `pmcid` would leave true duplicates in for any record without one (likely most of
+this bulk-matched pool, since most won't be open-access full text). **Still needed even though
+Step 9 is now one command**, not per-year consolidation you manually trigger — Step 9 still writes
+one JSONL file per year internally (for checkpointing/resumability), so something still has to
+merge those files into a single pool before scoring/sampling can use it. This step is that merge.
+It does not need to separately dedupe "AI vs ML" — Step 9's combined query already returns each
+matching record exactly once, so any duplication this step removes is purely cross-year (e.g. a
+record whose date metadata put it on a year boundary) or a record indexed without a PMID at all.
 
 **Command:**
 ```bash
@@ -378,69 +382,208 @@ docker compose run --rm pipeline dome-triage bulk-match build-candidates
 `bulk_match_summary.csv`, minus any cross-year duplicates.
 
 **Log:**
-- [ ] Run on: __________
-- Row count: __________
-- Decision/notes: __________
+- [x] Run on: 1st August 2026
+- **Row count: 744,647 unique records** (by `pmid`) — from 758,123 total loaded across the 27
+  year-files before dedup, so 13,476 cross-year/date-boundary duplicates removed. Written to
+  `data/interim/bulk_candidates.csv`.
+- Decision/notes: **Two real bugs found and fixed while running this for real, not in the small
+  test fixtures:**
+  1. **Dedup key was `pmcid`, fixed to `pmid`** per your instruction — PMCID only exists for
+     full-text-deposited records, PMID exists for nearly every Europe PMC/MEDLINE entry.
+  2. **OOM crash (exit 137)** on the first real attempt — loading all ~828k records as Pydantic
+     objects simultaneously exceeded available memory on this 15GB host. Rewrote to process one
+     year at a time (convert to DataFrame immediately, discard the Pydantic objects, dedupe the
+     running frame incrementally) — second attempt completed cleanly in 143s.
+  3. Also hit (and fixed) a **real EPMC data-quality issue**: some records have a bare `null`
+     inside `keywordList`/`pubTypeList`, which crashed strict validation — now filtered rather
+     than aborting the whole load over one bad list element.
+  Also note: `combined_count` from Step 9 (827,890, a live EPMC count-only estimate) vs. the
+  744,647 actually fetched+deduplicated here is a ~10% gap — plausible given EPMC's `hitCount` is
+  a live, constantly-updated estimate at query time, not a snapshot, and the per-year fetch uses
+  27 separate date-bounded queries vs. one continuous range for the count. Not investigated
+  further; the 744,647 figure (actually fetched, on disk, deduplicated) is the trustworthy one.
 
 ---
 
 ## Step 11 — Relevance-scoring bake-off
 
 **What's happening / why:** Empirically compares three scorers (weighted-sum, BM25, TF-IDF
-cosine) against the **already-labeled** records (Step 2's canonical dataset) before trusting any
-of them to rank the unlabeled bulk pool — a real empirical check, not an assumption.
+cosine) against the **already-labeled** records (Step 2's canonical dataset — real positive/
+negative ground truth, not a guess) before trusting any of them to rank the unlabeled bulk pool —
+a real empirical check, not an assumption. As of this rewrite, every scorer is run **twice**: once
+using only your approved positive lexicon (`keyword_lexicon.csv`), and again with your approved
+exclusionary/negative lexicon (`keyword_lexicon_exclusionary.csv`) subtracted as a penalty — a
+genuine before/after comparison of whether the exclusionary lexicon actually earns its keep, not
+just a claim that it does (`src/dome_triage/keywords/scoring_bakeoff.py`,
+`pipeline/steps.py::step_keywords_scoring_bakeoff`).
 
-> **Note:** this step was already run once, on 2026-07-28 (`data/provenance.jsonl` entry,
-> `step_name=keywords.scoring-bakeoff`, 213.9s duration), and `ROADMAP.md` records its result:
-> BM25 and TF-IDF-cosine (AUROC ≈0.76–0.77) both substantially outperform weighted-sum
-> (AUROC ≈0.67). **However, the output file `data/processed/scoring_bakeoff_report.csv` is not
-> currently present in `data/`** — re-run it below to regenerate the report and confirm the
-> result still holds on your current dataset before picking a scorer for Step 12.
+> **Historical note:** this step ran once before, on 2026-07-28 (213.9s, no exclusionary lexicon
+> existed yet, only positive-lexicon-only numbers), and `ROADMAP.md` recorded that result: BM25
+> and TF-IDF-cosine (AUROC ≈0.76–0.77) both substantially outperformed weighted-sum (AUROC≈0.67).
+> Treat that as historical color only — the lexicon, the metrics computed, and the code itself
+> have all changed substantially since (three-way curation, the added-terms tiers, the cleanup
+> pass, and everything below). Re-run it for real current numbers.
 
-**Command:**
+### How each scorer actually works
+
+All three take your approved lexicon (a list of terms + optional weights) and a corpus of paper
+texts (title + ". " + abstract), and produce one continuous **score per paper** — none of them are
+inherently a classifier; see "Is there a threshold cutoff?" below for how a score becomes a
+decision.
+
+- **`weighted-sum`**: for each paper, find every approved positive lexicon term that's a literal
+  (case-insensitive) substring anywhere in its text, and add up each matched term's weight (its
+  `discriminative_score` from your curation, or 1.0 if it has none). Fully transparent, cheap, and
+  the only one of the three that respects multi-word phrases exactly as written — but empirically
+  the weakest (AUROC≈0.67 historically).
+- **`bm25`**: a standard, decades-old search-engine ranking algorithm (Okapi BM25). Treats your
+  whole approved lexicon as one big search query and ranks every paper by how well it matches that
+  query — rewarding papers containing *rare* lexicon terms (rare across the whole scored corpus,
+  so more specific/discriminating) over just any lexicon term, and correcting for paper length so
+  a long abstract doesn't win purely by containing more words. **Caveat already found this
+  session**: BM25 flattens the lexicon to a flat bag of words — "machine learning" becomes two
+  separate tokens "machine"/"learning", so multi-word phrase structure isn't preserved.
+- **`tfidf-cosine`**: represents every paper *and* your whole lexicon (as one combined
+  pseudo-document) as vectors weighted by how distinctive each word is across the scored corpus,
+  then measures the angle (cosine similarity) between a paper's vector and the lexicon's vector —
+  closer angle = higher score. Same phrase-flattening caveat as BM25.
+
+### Is there a threshold cutoff? (yes, now — there wasn't before)
+
+All three scorers only ever produce a *ranking* score, not a yes/no. **AUROC needs no cutoff at
+all** — it measures ranking quality (does the scorer put positives above negatives?) across every
+possible threshold at once, from 0.5 (no better than chance) to 1.0 (perfect). But
+accuracy/precision/recall/the confusion matrix (true/false positive/negative) genuinely require
+picking one specific score value above which a paper counts as "positive."
+
+Until this rewrite, no such cutoff existed in the code at all. It now uses each scorer's own
+**Youden's-J-optimal threshold**: the point on that scorer's ROC curve that maximizes (true
+positive rate − false positive rate) — the standard, principled way statistics/ML literature picks
+a single operating point from a continuous score, not an arbitrary guess. It's computed fresh per
+scorer per condition and reported explicitly as `threshold_youden` in the output, so it's fully
+transparent and reproducible — you can see the exact number, not just trust it.
+
+### Metrics glossary (what each column in the report means)
+
+| Metric | Meaning |
+|---|---|
+| `n_positive` / `n_negative` / `n_total` | **How many already-labeled papers were actually presented to the scorer for this evaluation** — pulled from `canonical_dataset.csv` where `label` is `positive` or `negative` (`undeterminable`/`irrelevant`/`skipped` excluded). Same set for every scorer and both conditions, so comparisons are apples-to-apples. |
+| `auroc` | Area under the ROC curve — how well the scorer ranks positives above negatives across *all* possible thresholds. 0.5 = no better than random guessing, 1.0 = perfect ranking. Needs no cutoff. |
+| `threshold_youden` | The specific score value above which this scorer's papers are called "positive" for every metric below — see above. |
+| `accuracy` | Of all `n_total` papers, what fraction were classified correctly (either genuinely positive and flagged positive, or genuinely negative and flagged negative) at that threshold. |
+| `precision` | Of the papers the scorer *flagged* as positive, what fraction were *actually* positive. High precision = few false alarms. |
+| `recall` | Of the papers that were *actually* positive, what fraction the scorer correctly flagged. High recall = few genuine positives missed. |
+| `f1` | Harmonic mean of precision and recall — one balanced number when you care about both roughly equally. |
+| `true_positive` | Genuinely positive papers correctly flagged positive. |
+| `true_negative` | Genuinely negative papers correctly flagged negative. |
+| `false_positive` | Genuinely negative papers *wrongly* flagged positive (a false alarm). |
+| `false_negative` | Genuinely positive papers *wrongly* flagged negative (a miss). |
+| `correlation_with_label` | Pearson correlation between the raw continuous score and the true 0/1 label — a cruder companion sanity check to AUROC. |
+| `precision_recall_at_quantiles` | Precision/recall if you'd instead drawn the line at the top 50%/25%/10% of scores rather than the Youden point — context for Phase 6's future confidence-routing thresholds, which won't necessarily use the Youden point. |
+| `condition` | `positive_lexicon_only` or `positive_plus_exclusionary_lexicon` — which of the two runs this row is from; see below. |
+
+### The two conditions — what to actually look for
+
+Compare the **same scorer's** two rows: does `positive_plus_exclusionary_lexicon` improve on
+`positive_lexicon_only` (higher AUROC, better precision without recall collapsing)? If yes,
+that's empirical proof the exclusionary lexicon (the `forest`/`random`/`neural`/`area`/`bayes`
+terms and the rest) is earning its keep, not just a nice idea. If it's not run for
+`positive_plus_exclusionary_lexicon` at all, `keyword_lexicon_exclusionary.csv` wasn't found —
+shouldn't happen now that tier 3 is promoted (Step 8d), but the step degrades gracefully to one
+condition if so, and says which in its printed summary.
+
+**Command** (same as before — both conditions run automatically now, no new flags needed):
 ```bash
 docker compose run --rm pipeline dome-triage keywords scoring-bakeoff
 ```
 
-**Expected output:** `data/processed/scoring_bakeoff_report.csv` (3 rows — one per scorer — with
-AUROC or equivalent metric per scorer). Takes ~3–4 minutes based on the prior run.
+**Expected output:** `data/processed/scoring_bakeoff_report.csv` — **6 rows** (3 scorers ×
+2 conditions), sorted by scorer then condition so each scorer's before/after pair sits together,
+with every column from the glossary above. Takes a few minutes (213.9s historically for one
+condition — expect roughly double for two).
 
-**Validate before continuing:** Read the report. Confirm which scorer(s) win. This is a genuine
-decision point — don't rubber-stamp the numbers above without checking your own regenerated
-report, since the dataset has likely changed since 2026-07-28.
+**Validate before continuing:** Read the report. For each scorer, compare its two condition rows.
+Confirm which scorer(s) win overall, and whether the exclusionary lexicon actually helped. This is
+a genuine decision point — don't rubber-stamp any prior numbers, the dataset and lexicon have
+changed since any earlier run.
 
 **Log:**
-- [ ] Run on: __________
-- Report results (scorer: AUROC): __________
-- Scorer chosen for Step 12: __________
+- [x] Run on: 1st August 2026, 07:20 UTC finish (duration 753.8s, ~12.6 minutes for all 6 rows)
+- **Positive/negative volume presented: 1,878 positive / 1,907 negative (3,785 total)** —
+  verified directly against Step 2's canonical dataset (4,320 total records; 533 `skipped` +
+  2 `conflict` excluded as not definitive ground truth).
+- **Full results, explained figure-by-figure, with feedback: → [`SCORING_BAKEOFF_RESULTS.md`](SCORING_BAKEOFF_RESULTS.md)**
+  (kept as a separate file rather than duplicated here — it's a full report, not a log entry).
+  Headline: BM25 AUROC 0.767→0.774 (barely moves), **TF-IDF-cosine AUROC 0.765→0.797 (clearest
+  real improvement from the exclusionary lexicon)**, weighted-sum's exclusionary run hit a real
+  bug (AUROC collapsed to 0.454, worse than random) — found, explained, and **fixed in code**
+  (`WeightedSumScorer` was subtracting an unweighted match count instead of each exclusionary
+  term's own tiny weight); not yet re-run post-fix.
+- Did the exclusionary lexicon measurably help? **Yes for TF-IDF-cosine** (clearly, the biggest
+  mover of the three — not statistically tested yet, that's a later-phase capability). Negligible
+  for BM25. Uninterpretable for weighted-sum until re-run with the fix.
+- Scorer (and condition) chosen for Step 12: __________ (my recommendation: `tfidf-cosine` with
+  the exclusionary lexicon — see the linked report's "My feedback" section — but this is your call)
 - Decision/notes: __________
 
 ---
 
 ## Step 12 — Score the bulk pool with the chosen scorer
 
-**What's happening / why:** Applies the scorer you picked in Step 11 to every record in the
-bulk candidate pool, producing a `match_score` per record. This is what Step 13's stratified
-sample gets drawn from.
+**What's happening / why:** Applies the scorer you picked in Step 11 — **`tfidf-cosine`, with the
+exclusionary lexicon applied** (your decision, see `SCORING_BAKEOFF_RESULTS.md`) — to every one of
+the ~745,000 records in the bulk candidate pool (Step 10), producing a `match_score` per record.
+This is what Step 13's stratified sample gets drawn from.
 
-**Command** (replace `bm25` with whatever you chose in Step 11 — options are `weighted-sum`,
-`bm25`, `tfidf-cosine`, or `all`; CLI default if you omit `--scorer` is `weighted-sum`, so don't
-omit it):
+As of this rewrite, one command now also adds (`src/dome_triage/pipeline/steps.py::
+step_keywords_score_bulk_match`):
+- **`match_classification__tfidf-cosine`** (`positive`/`negative`) — the raw score converted to a
+  clear call using the *exact* Youden-optimal threshold Step 11 already validated for
+  `tfidf-cosine` + `positive_plus_exclusionary_lexicon` (reused from
+  `scoring_bakeoff_report.csv`, not recomputed) — so you get **both** a continuous score to sort/
+  threshold by yourself **and** a ready-made positive/negative split ("the positive stream and
+  the negative stream") for a first pass.
+- **`already_curated`** / **`existing_label`** / **`existing_label_confidence`** — does this
+  candidate already exist in `canonical_dataset.csv` from a prior curation round (matched by
+  pmcid, else pmid, else doi), and if so what was it already decided as. This is **reporting/
+  visibility metadata on this file**, not something that flows into the Curate app automatically
+  — `already_curated=True` records are already structurally excluded from being re-added as
+  duplicates by Step 13's existing merge logic (`_merge_new_candidates_into_canonical`), so they
+  were never going to double up in your queue either way. What this column actually gives you:
+  a clear number for how much of the 745k pool is genuinely new territory vs. already-covered
+  ground, right in this file and in the step's printed summary.
+- **`has_pmcid`** — full text deposited in PMC or not, for your own filtering/stratification.
+
+**Command** (already decided: `tfidf-cosine`; `--exclusionary-weight` defaults to `1.0`, matching
+Step 11's validated run):
 ```bash
-docker compose run --rm pipeline dome-triage keywords score-bulk-match --scorer bm25
+docker compose run --rm pipeline dome-triage keywords score-bulk-match --scorer tfidf-cosine
 ```
 
-**Expected output:** `data/interim/bulk_candidates_scored.csv` (per
-`configs/sampling.yaml`'s `paths.bulk_candidates_scored`), same row count as
-`bulk_candidates.csv` plus a `match_score` column.
+**⚠️ Scale warning, genuinely untested at this size**: Step 10's OOM crash (build-candidates,
+~828k records loaded as Python objects) was fixed by processing year-by-year instead of all at
+once. This step is different — it fits a TF-IDF vectorizer and computes cosine similarity over
+**text only** (title+abstract strings, not heavy Pydantic objects), which is much lighter per
+record, but it's never been run at ~745k scale before and the vectorizer has no `max_features`
+cap. If it's slow or runs out of memory, that's a real possibility, not a hypothetical — tell me
+and we'll fix it the same way (chunked/batched processing), the same as Steps 9 and 10.
+
+**Expected output:** `data/interim/bulk_candidates_scored.csv`, same row count as
+`bulk_candidates.csv` (744,647) plus: `match_score__tfidf-cosine`, `matched_terms__tfidf-cosine`,
+`match_classification__tfidf-cosine`, `already_curated`, `existing_label`,
+`existing_label_confidence`, `has_pmcid`.
 
 **Validate before continuing:** Score distribution isn't degenerate (not everything scoring 0 or
-identical).
+identical). Check the printed summary for the `already_curated` / `has_pmcid` percentages — sanity
+check they're plausible (e.g. `already_curated` should be small, a few thousand out of 745k, not
+a large fraction).
 
 **Log:**
 - [ ] Run on: __________
-- Scorer used: __________
 - Row count: __________
+- `already_curated` count / %: __________
+- `has_pmcid` count / %: __________
+- Positive / negative split from `match_classification__tfidf-cosine`: __________
 - Decision/notes: __________
 
 ---
@@ -449,14 +592,19 @@ identical).
 
 **What's happening / why:** Draws a diverse, size-controlled sample from the scored bulk pool —
 stratified by match-score band × journal bucket × year bucket — rather than a raw score-cutoff
-dump, so the curation queue isn't dominated by one journal or one score band. **The size of the
-output file is the number of new papers you're about to be asked to manually review** — this is
-the single biggest driver of your curation workload.
+dump, so the curation queue isn't dominated by one journal or one score band. **This is where
+"different thresholds, journal diversity etc." already lives** (`configs/sampling.yaml`:
+`n_score_bands`, `top_n_journals`, `year_bucket_width`, `cap_per_stratum`) — no code changes were
+needed for that part, it was already built this way. **The size of the output file is the number
+of new papers you're about to be asked to manually review** — this is the single biggest driver
+of your curation workload.
 
-Current config (`configs/sampling.yaml`): `cap_per_stratum: 10`, ~320 stratum combinations (4
-score bands × 15 top journals + "other" × 5 year buckets) → **~3,000–3,200 candidates expected**
-per `ROADMAP.md`'s worked example. If that's too many or too few for a first pass, edit
-`cap_per_stratum` in `configs/sampling.yaml` before running (it's the one knob to change).
+Current config: `cap_per_stratum: 10` → **~3,000–3,200 candidates expected** per `ROADMAP.md`'s
+worked example (this was sized for the original, much smaller bulk pool estimate — worth
+reconsidering now that the actual pool is 745k, not the ~5-10k originally envisioned; the strata
+themselves scale with the *data*, not the pool size, so this estimate likely still roughly holds,
+but check the `stratum_report.csv` `available` column once run). Edit `cap_per_stratum` in
+`configs/sampling.yaml` before running if you want more/fewer — it's the one knob to change.
 
 **Command:**
 ```bash
@@ -464,17 +612,32 @@ docker compose run --rm pipeline dome-triage sampling stratify
 ```
 
 **Expected output:** `data/processed/stratified_candidate_pool.csv` and
-`data/processed/stratum_report.csv`. New candidates are merged into
-`canonical_dataset.csv`'s curation queue.
+`data/processed/stratum_report.csv`. New candidates are merged into `canonical_dataset.csv`'s
+curation queue — **already-`already_curated` overlaps are automatically excluded from this merge
+already** (matched by pmcid/pmid/doi), so no separate "merge previous pos/neg" step is needed —
+that mechanism already existed (`_merge_new_candidates_into_canonical`), it just wasn't visible
+until Step 12's new `already_curated` column made it so.
+
+**Once merged, review via the existing Curate app** (`docker compose up curate` → "Curate" page)
+— same interface as before, now with two new toggles at the top:
+- **"Include already-curated records (redo / re-review)"** — off by default. **Real fix, not just
+  a nice-to-have**: before this, the Curate app's queue had *no filter at all* for already-labeled
+  records — opening it fresh would have presented all ~4,320 already-curated
+  `human_curated`/`registry_confirmed` records (from `DOME_Top_Curate` etc.) for review alongside
+  genuinely new ones. Now those are excluded by default (they're settled ground truth), and this
+  toggle lets you deliberately re-review them if you want to.
+- **"Only show records with full text available (has PMCID)"** — off by default, filters the
+  queue to `pmcid`-having records only.
 
 **Validate before continuing:** Row count of `stratified_candidate_pool.csv` is in the expected
-ballpark for your `cap_per_stratum`. Check `stratum_report.csv` for any wildly underfilled strata
-(may indicate a config or data issue, not necessarily a problem).
+ballpark for your `cap_per_stratum`. Check `stratum_report.csv` for any wildly underfilled strata.
 
 **Log:**
 - [ ] Run on: __________
 - `cap_per_stratum` used: __________
 - Candidates produced: __________
+- New records actually merged into `canonical_dataset.csv` (vs. already-present, per the step's
+  printed summary): __________
 - Decision/notes: __________
 
 ---
