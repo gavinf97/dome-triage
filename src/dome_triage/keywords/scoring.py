@@ -16,6 +16,7 @@ import pandas as pd
 from rank_bm25 import BM25Okapi
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from tqdm import tqdm
 
 from dome_triage.keywords.preprocess import clean_text
 
@@ -73,7 +74,7 @@ class WeightedSumScorer:
         exclusionary_weight: float = 1.0,
     ) -> list[ScoredResult]:
         results = []
-        for text in corpus_texts:
+        for text in tqdm(corpus_texts, desc=f"{self.name}: scoring", unit="doc"):
             matched = _find_matched_terms(text, lexicon_terms)
             total = sum(self.term_weights.get(term, 0.0) for term in matched)
             if exclusionary_terms:
@@ -108,7 +109,13 @@ class Bm25Scorer:
         exclusionary_terms: list[str] | None = None,
         exclusionary_weight: float = 1.0,
     ) -> list[ScoredResult]:
-        tokenized_corpus = [clean_text(t).split() for t in corpus_texts]
+        tokenized_corpus = []
+        matched_terms = []
+        for text in tqdm(corpus_texts, desc="bm25: cleaning + tokenizing corpus", unit="doc"):
+            tokenized_corpus.append(clean_text(text).split())
+            matched_terms.append(_find_matched_terms(text, lexicon_terms))
+
+        print(f"bm25: indexing {len(tokenized_corpus)} documents and scoring...")
         bm25 = BM25Okapi(tokenized_corpus)
         query_tokens = clean_text(" ".join(lexicon_terms)).split()
         scores = bm25.get_scores(query_tokens)
@@ -116,7 +123,7 @@ class Bm25Scorer:
             exclusionary_query_tokens = clean_text(" ".join(exclusionary_terms)).split()
             exclusionary_scores = bm25.get_scores(exclusionary_query_tokens)
             scores = scores - exclusionary_weight * exclusionary_scores
-        matched_terms = [_find_matched_terms(t, lexicon_terms) for t in corpus_texts]
+        print("bm25: done.")
         return list(zip((float(s) for s in scores), matched_terms))
 
 
@@ -138,16 +145,23 @@ class TfidfCosineScorer:
         exclusionary_terms: list[str] | None = None,
         exclusionary_weight: float = 1.0,
     ) -> list[ScoredResult]:
-        cleaned_corpus = [clean_text(t) for t in corpus_texts]
+        cleaned_corpus = []
+        matched_terms = []
+        for text in tqdm(corpus_texts, desc="tfidf-cosine: cleaning corpus", unit="doc"):
+            cleaned_corpus.append(clean_text(text))
+            matched_terms.append(_find_matched_terms(text, lexicon_terms))
+
         pseudo_query = clean_text(" ".join(lexicon_terms))
         extra_docs = [pseudo_query]
         if exclusionary_terms:
             extra_docs.append(clean_text(" ".join(exclusionary_terms)))
 
+        print(f"tfidf-cosine: fitting vectorizer over {len(cleaned_corpus)} documents...")
         vectorizer = TfidfVectorizer()
         matrix = vectorizer.fit_transform([*cleaned_corpus, *extra_docs])
         doc_vectors = matrix[: len(cleaned_corpus)]
         query_vector = matrix[len(cleaned_corpus)]
+        print("tfidf-cosine: computing cosine similarity...")
         similarities = cosine_similarity(doc_vectors, query_vector).ravel()
 
         if exclusionary_terms:
@@ -155,7 +169,7 @@ class TfidfCosineScorer:
             exclusionary_similarities = cosine_similarity(doc_vectors, exclusionary_vector).ravel()
             similarities = similarities - exclusionary_weight * exclusionary_similarities
 
-        matched_terms = [_find_matched_terms(t, lexicon_terms) for t in corpus_texts]
+        print("tfidf-cosine: done.")
         return list(zip((float(s) for s in similarities), matched_terms))
 
 

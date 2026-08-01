@@ -650,24 +650,33 @@ def step_keywords_score_bulk_match(
     exact scorer + condition (positive-only vs positive-plus-exclusionary, auto-detected from
     whether an exclusionary lexicon was found) -- see `_lookup_youden_threshold`."""
     started_at = time.monotonic()
+    print("score-bulk-match: [1/6] loading positive lexicon...")
     lexicon_path = cfg.path("processed_dir") / "keyword_lexicon.csv"
     lexicon_df = pd.read_csv(lexicon_path)
     lexicon_terms, term_weights = load_lexicon_terms_and_weights(lexicon_df)
+    print(f"score-bulk-match:   {len(lexicon_terms)} positive terms loaded.")
 
+    print("score-bulk-match: [2/6] loading exclusionary lexicon (if present)...")
     exclusionary_path = resolve_path(cfg.pipeline["keywords"]["exclusionary_lexicon"])
     exclusionary_terms: list[str] = []
     exclusionary_term_weights: dict[str, float] = {}
     if exclusionary_path.exists():
         exclusionary_df = pd.read_csv(exclusionary_path)
         exclusionary_terms, exclusionary_term_weights = load_lexicon_terms_and_weights(exclusionary_df)
+        print(f"score-bulk-match:   {len(exclusionary_terms)} exclusionary terms loaded.")
+    else:
+        print("score-bulk-match:   no exclusionary lexicon found -- positive-only condition.")
     condition = "positive_plus_exclusionary_lexicon" if exclusionary_terms else "positive_lexicon_only"
 
+    print("score-bulk-match: [3/6] loading bulk candidates (this can take a minute at 700k+ rows)...")
     candidates_path = cfg.sampling_path("bulk_candidates")
     candidates = pd.read_csv(candidates_path, dtype=str)
     texts = (candidates["title"].fillna("") + ". " + candidates["abstract"].fillna("")).tolist()
+    print(f"score-bulk-match:   {len(candidates)} candidates loaded.")
 
     candidates["has_pmcid"] = candidates["pmcid"].notna() & (candidates["pmcid"] != "")
 
+    print("score-bulk-match: [4/6] cross-referencing against canonical_dataset.csv for already-curated records...")
     canonical_path = cfg.path("canonical_dataset")
     if canonical_path.exists():
         existing_lookup = _build_existing_label_lookup(pd.read_csv(canonical_path, dtype=str))
@@ -676,12 +685,16 @@ def step_keywords_score_bulk_match(
         candidates["already_curated"] = False
         candidates["existing_label"] = ""
         candidates["existing_label_confidence"] = ""
+    print(f"score-bulk-match:   {int(candidates['already_curated'].sum())} already curated; "
+          f"{int(candidates['has_pmcid'].sum())} have a PMCID.")
 
     bakeoff_report_path = cfg.path("processed_dir") / "scoring_bakeoff_report.csv"
     thresholds_used: dict[str, float] = {}
 
     names_to_run = list(SCORERS) if scorer_name == "all" else [scorer_name]
-    for name in names_to_run:
+    print(f"score-bulk-match: [5/6] scoring with: {', '.join(names_to_run)} (condition={condition})")
+    for i, name in enumerate(names_to_run, start=1):
+        print(f"score-bulk-match:   scorer {i}/{len(names_to_run)}: {name}")
         scorer = _build_scorer(name, term_weights, exclusionary_term_weights)
         scored = scorer.score_corpus(
             texts,
@@ -698,9 +711,23 @@ def step_keywords_score_bulk_match(
             candidates[f"match_classification__{name}"] = [
                 "positive" if s >= threshold else "negative" for s in candidates[f"match_score__{name}"]
             ]
+            n_pos = int((candidates[f"match_classification__{name}"] == "positive").sum())
+            n_neg = int((candidates[f"match_classification__{name}"] == "negative").sum())
+            print(
+                f"score-bulk-match:     classified at Youden threshold {threshold:.5g} "
+                f"(from Step 11's bake-off): {n_pos} positive, {n_neg} negative -- "
+                "both retained in the output, negative is NOT dropped."
+            )
+        else:
+            print(
+                f"score-bulk-match:     no validated threshold found for {name}/{condition} in "
+                "scoring_bakeoff_report.csv -- match_score written, no classification column added."
+            )
 
+    print(f"score-bulk-match: [6/6] writing {len(candidates)} scored candidates to disk...")
     output_path = cfg.sampling_path("bulk_candidates_scored")
     candidates.to_csv(output_path, index=False)
+    print(f"score-bulk-match: done -- wrote {output_path}")
 
     n_already_curated = int(candidates["already_curated"].sum())
     n_has_pmcid = int(candidates["has_pmcid"].sum())

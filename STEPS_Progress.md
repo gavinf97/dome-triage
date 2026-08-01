@@ -522,27 +522,41 @@ changed since any earlier run.
 - Did the exclusionary lexicon measurably help? **Yes for TF-IDF-cosine** (clearly, the biggest
   mover of the three — not statistically tested yet, that's a later-phase capability). Negligible
   for BM25. Uninterpretable for weighted-sum until re-run with the fix.
-- Scorer (and condition) chosen for Step 12: __________ (my recommendation: `tfidf-cosine` with
-  the exclusionary lexicon — see the linked report's "My feedback" section — but this is your call)
-- Decision/notes: __________
+- Scorer (and condition) chosen for Step 12: **`bm25`, with the exclusionary lexicon applied**
+  (your explicit choice — TF-IDF-cosine had the bigger exclusionary-lexicon lift in the bake-off,
+  but BM25's own AUROC was already close behind at 0.774 vs 0.797, and you preferred BM25 as the
+  production scorer). Superseded the earlier draft recommendation of `tfidf-cosine` below.
+- Decision/notes: BM25 chosen over TF-IDF-cosine on 2026-08-01. Real Youden threshold for
+  `bm25` + `positive_plus_exclusionary_lexicon` from `scoring_bakeoff_report.csv`:
+  **107.59714643077095** (BM25 scores are unbounded corpus-relative numbers, not a 0-1 similarity
+  like TF-IDF-cosine — a threshold in the hundreds is expected and correct, not a bug).
 
 ---
 
 ## Step 12 — Score the bulk pool with the chosen scorer
 
-**What's happening / why:** Applies the scorer you picked in Step 11 — **`tfidf-cosine`, with the
-exclusionary lexicon applied** (your decision, see `SCORING_BAKEOFF_RESULTS.md`) — to every one of
-the ~745,000 records in the bulk candidate pool (Step 10), producing a `match_score` per record.
-This is what Step 13's stratified sample gets drawn from.
+**What's happening / why:** Applies the scorer you picked in Step 11 — **`bm25`, with the
+exclusionary lexicon applied** (your decision, see the log above and `SCORING_BAKEOFF_RESULTS.md`
+for the full comparison against TF-IDF-cosine and weighted-sum) — to every one of the ~745,000
+records in the bulk candidate pool (Step 10), producing a `match_score` per record. This is what
+Step 13's stratified sample gets drawn from.
 
 As of this rewrite, one command now also adds (`src/dome_triage/pipeline/steps.py::
 step_keywords_score_bulk_match`):
-- **`match_classification__tfidf-cosine`** (`positive`/`negative`) — the raw score converted to a
+- **`match_classification__bm25`** (`positive`/`negative`) — the raw score converted to a
   clear call using the *exact* Youden-optimal threshold Step 11 already validated for
-  `tfidf-cosine` + `positive_plus_exclusionary_lexicon` (reused from
-  `scoring_bakeoff_report.csv`, not recomputed) — so you get **both** a continuous score to sort/
-  threshold by yourself **and** a ready-made positive/negative split ("the positive stream and
-  the negative stream") for a first pass.
+  `bm25` + `positive_plus_exclusionary_lexicon` (reused from `scoring_bakeoff_report.csv`, not
+  recomputed) — so you get **both** a continuous score to sort/threshold by yourself **and** a
+  ready-made positive/negative split ("the positive stream and the negative stream") for a first
+  pass. **Neither stream is dropped from the output file** — `match_classification__bm25` is just
+  an extra column on every row; `negative`-classified rows stay in `bulk_candidates_scored.csv`
+  and remain fully eligible for Step 13's stratified sampling into the curation queue, so you can
+  manually review/reclassify them yourself rather than having them silently discarded by the
+  algorithm. Verified directly in code: `step_keywords_score_bulk_match` only ever *adds* columns
+  to the candidates DataFrame and writes the full frame back out; `step_sampling_stratify` reads
+  that full frame and stratifies by score *band* (quantiles of the raw score), not by the
+  positive/negative classification column — nothing in the path from Step 12 to the curation queue
+  filters on `match_classification__bm25`.
 - **`already_curated`** / **`existing_label`** / **`existing_label_confidence`** — does this
   candidate already exist in `canonical_dataset.csv` from a prior curation round (matched by
   pmcid, else pmid, else doi), and if so what was it already decided as. This is **reporting/
@@ -554,36 +568,46 @@ step_keywords_score_bulk_match`):
   ground, right in this file and in the step's printed summary.
 - **`has_pmcid`** — full text deposited in PMC or not, for your own filtering/stratification.
 
-**Command** (already decided: `tfidf-cosine`; `--exclusionary-weight` defaults to `1.0`, matching
+**Live progress in the terminal**: this step used to run completely silently (blank terminal for
+the whole run). Fixed — it now prints numbered phase markers (`[1/6]` loading lexicon ... `[6/6]`
+writing output) plus a live `tqdm` progress bar for the corpus-scoring pass itself
+(`bm25: cleaning + tokenizing corpus`), so you can see it's alive and roughly how far through it
+is at every stage, not just at the very end.
+
+**Command** (already decided: `bm25`; `--exclusionary-weight` defaults to `1.0`, matching
 Step 11's validated run):
 ```bash
-docker compose run --rm pipeline dome-triage keywords score-bulk-match --scorer tfidf-cosine
+docker compose run --rm pipeline dome-triage keywords score-bulk-match --scorer bm25
 ```
 
 **⚠️ Scale warning, genuinely untested at this size**: Step 10's OOM crash (build-candidates,
 ~828k records loaded as Python objects) was fixed by processing year-by-year instead of all at
-once. This step is different — it fits a TF-IDF vectorizer and computes cosine similarity over
-**text only** (title+abstract strings, not heavy Pydantic objects), which is much lighter per
-record, but it's never been run at ~745k scale before and the vectorizer has no `max_features`
-cap. If it's slow or runs out of memory, that's a real possibility, not a hypothetical — tell me
-and we'll fix it the same way (chunked/batched processing), the same as Steps 9 and 10.
+once. This step is different — it tokenizes **text only** (title+abstract strings, not heavy
+Pydantic objects) and builds one in-memory BM25 index over the whole corpus, which is much lighter
+per record than Step 10's Pydantic objects, but it's never been run at ~745k scale before. If it's
+slow or runs out of memory, that's a real possibility, not a hypothetical — tell me and we'll fix
+it the same way (chunked/batched processing), the same as Steps 9 and 10.
 
 **Expected output:** `data/interim/bulk_candidates_scored.csv`, same row count as
-`bulk_candidates.csv` (744,647) plus: `match_score__tfidf-cosine`, `matched_terms__tfidf-cosine`,
-`match_classification__tfidf-cosine`, `already_curated`, `existing_label`,
+`bulk_candidates.csv` (744,647) plus: `match_score__bm25`, `matched_terms__bm25`,
+`match_classification__bm25`, `already_curated`, `existing_label`,
 `existing_label_confidence`, `has_pmcid`.
 
 **Validate before continuing:** Score distribution isn't degenerate (not everything scoring 0 or
 identical). Check the printed summary for the `already_curated` / `has_pmcid` percentages — sanity
 check they're plausible (e.g. `already_curated` should be small, a few thousand out of 745k, not
-a large fraction).
+a large fraction). Also sanity-check the negative-classified count is nonzero and roughly
+comparable in scale to positive (per Step 11's bake-off, the underlying positive/negative
+population was close to a 50/50 split — 1,878/1,907 — so a wildly lopsided split at 745k scale is
+worth a second look, not necessarily wrong, but worth noticing).
 
 **Log:**
 - [ ] Run on: __________
 - Row count: __________
 - `already_curated` count / %: __________
 - `has_pmcid` count / %: __________
-- Positive / negative split from `match_classification__tfidf-cosine`: __________
+- Positive / negative split from `match_classification__bm25`: __________
+- Confirmed negative-classified rows are still present in the output file (not dropped): __________
 - Decision/notes: __________
 
 ---
