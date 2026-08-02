@@ -69,6 +69,9 @@ docker compose run --rm pipeline dome-triage sampling stratify
 docker compose run --rm pipeline dome-triage ingest fetch-clear-negatives --year-from 2015 --year-to 2025
 
 # 5. Human curation (http://localhost:8501)
+# ... before you start, read/update curation_criteria/CRITERIA.md -- your living rulebook for
+#     what counts as Positive/Negative/Undeterminable/Skipped, so the bar stays consistent
+#     across a curation project that spans many sessions ...
 docker compose up curate
 # ... after a curation session, fold decisions back into the canonical dataset ...
 docker compose run --rm pipeline dome-triage curate materialize

@@ -903,6 +903,14 @@ quick title/abstract/MeSH decision — **~28-58 hours total**, doable across man
 resumes exactly where you left off; nothing is lost between sessions). Use Step 15a's new filters
 to work through it in whatever diverse order suits you, not necessarily top-to-bottom.
 
+**Before you start (or resume) a session, read/update
+[`curation_criteria/CRITERIA.md`](curation_criteria/CRITERIA.md)** — your own living rulebook for
+what actually counts as Positive/Negative/Undeterminable/Skipped, seeded with suggested starting
+criteria and edge-case guidance. It exists specifically so your bar doesn't quietly drift across a
+curation project spanning many sessions/weeks — see the file's own "Why this matters" section for
+the reasoning (label consistency directly affects the BERT fine-tune this dataset is for). Add to
+it as you go; log any actual rule *change* (not just a clarification) in its changelog section.
+
 **Command:**
 ```bash
 docker compose up curate
