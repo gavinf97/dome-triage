@@ -18,8 +18,9 @@ human looks at it, and exactly what gets reviewed where:
 | 3 | `bulk-match fetch --year-from Y1 --year-to Y2` (one call, e.g. 2000–2026; still one EPMC query per year internally, checkpointed/resumable) | per-year raw EPMC query cache + `bulk_match_summary.csv` (AI-only/ML-only/combined-deduplicated counts, dated) | Not reviewed individually — sanity-checked in aggregate (row counts, field completeness, the printed count breakdown) | `bulk-match build-candidates` → `bulk_candidates.csv` |
 | 4 | `keywords scoring-bakeoff` | comparison report (`scoring_bakeoff_report.csv`) | Human reads the report and picks the winning scorer(s) — a real decision point | recorded choice (used as `--scorer`) |
 | 5 | `keywords score-bulk-match --scorer <chosen>` | `bulk_candidates_scored.csv` (`match_score` per record) | Not reviewed directly — this is what the stratified sample is drawn from | — |
-| 6 | `sampling stratify` (human sets `cap_per_stratum` first) | `stratified_candidate_pool.csv` — **this file's size is the number of new papers needing manual review** | **Curate app** (`docker compose up curate`) — one paper at a time: positive / negative / undeterminable / skipped, plus structured feature flags, MeSH shown for context | Folded into `canonical_dataset.csv` via `curate materialize` |
-| 7 | `ingest fetch-clear-negatives` | `clear_negative_candidates.csv` | Same Curate app queue, tagged as clear-negative candidates | Same as #6 |
+| 6 | `sampling stratify` (human sets `cap_per_stratum` first) | `stratified_candidate_pool.csv` — **this file's size is the number of new papers needing manual review** | **Curate app** (`docker compose up curate`) — one paper at a time: positive / negative / undeterminable / skipped, plus structured feature flags, MeSH shown for context; filterable by BM25 score band/journal/year/classification, with a live diversity dashboard | Folded into `canonical_dataset.csv` via `curate materialize` (also upgrades `label_confidence` to `human_curated` on a clean decision) |
+| 7 | `ingest fetch-clear-negatives --sample-size N --merge-limit M` (live EPMC query, the structural inverse of #3's AI/ML query — genuinely disjoint from the 750k pool, not derived from it; journal/year-stratified; `--merge-limit` phases how much lands in the canonical dataset per round to avoid skewing its pos/neg balance) | `clear_negative_candidates.csv` (full diverse pool) | Same Curate app queue, tagged `source_name=clear_negative_sampler` | Same as #6 |
+| 7b | `ingest screen-clear-negatives` — re-scores #7's output against the *same* lexicon/threshold #5 uses; a "clear negative" that still scores high despite the exclusion query gets flagged | `clear_negative_candidates_screened.csv` (`needs_screening` column) | Curate app — flagged records show an inline warning + a "needs-screening-only" filter to batch-review them together | Same as #6 (the flag itself never auto-rejects; the decision is still human) |
 
 Everything from Phase 3 onward follows the same pattern: automated step produces a report or
 artifact, human reviews it at a named decision point (picking the winning model from a bake-off
@@ -28,19 +29,30 @@ sample from the full scan) before the next step proceeds — nothing auto-promot
 
 ## Curation workload estimate
 
-Steps #6 and #7 above are where the real manual labor lives, and its size is directly controlled
-by config, not fixed by the code:
+Steps #6, #7, and #7b above are where the real manual labor lives, and its size is directly
+controlled by config, not fixed by the code. Updated against the real, run pool (Step 9-10's bulk
+pool turned out to be **744,647 records**, not the ~5-10k originally envisioned when this estimate
+was first drafted — the strata themselves scale with the *data's* diversity, not the pool's row
+count, so the arithmetic below still roughly holds, but it's worth rechecking `stratum_report.csv`
+after a real run rather than trusting the estimate blindly):
 
 - Strata: ~4 match-score bands × ~16 journal buckets (top 15 + "other") × ~5 year buckets
   (5-year bins) ≈ **320 stratum combinations** (`configs/sampling.yaml`).
 - `cap_per_stratum` is the single knob: cap=5 → up to ~1,600 candidates queued; cap=10 → up to
   ~3,200; cap=20 → up to ~6,400 (actual totals typically land somewhat below the theoretical max).
 - Suggested starting point for a first pass: **cap=10 (≈3,000-3,200 candidates from the
-  AI/ML-matched pool) + a matched ≈1,500-2,000 clear-negative sample** — roughly **4,500-5,000
-  new papers**. At a realistic 20-40 seconds per quick title/abstract/MeSH decision in the app,
-  that's very roughly 25-55 hours of curation, doable across many sessions (the app resumes
-  exactly where it left off).
-- Not a commitment — `cap_per_stratum` is the one number to change for a second pass.
+  AI/ML-matched pool) + `--sample-size 10000 --merge-limit 2000` clear negatives (≈2,000 merged
+  this round, out of a ~10k diverse pool built for later rounds)** — roughly **5,000-5,200 new
+  papers**, replacing the earlier blanket "1,500-2,000 clear-negative" estimate now that the
+  clear-negative step is deliberately phased (see Step 14 in `STEPS_Progress.md` for the full
+  class-imbalance arithmetic behind the 2,000 figure). At a realistic 20-40 seconds per quick
+  title/abstract/MeSH decision in the app, that's very roughly 28-58 hours of curation, doable
+  across many sessions (the app resumes exactly where it left off).
+- Step 7b (screening) adds negligible extra *volume* — it flags a subset of #7's own candidates
+  for closer attention, it doesn't queue additional papers.
+- Not a commitment — `cap_per_stratum` and `--merge-limit` are the two numbers to change for a
+  second pass, once the live pos/neg ratio (visible in the Curate app's diversity dashboard) says
+  it's time.
 
 ## Phase 0 — Repo scaffold ✅
 
@@ -61,6 +73,16 @@ Docker, README, AGENTS.md, CC BY 4.0 license, GitHub remote, CLI skeleton, confi
   `include_already_labeled`/`require_pmcid` toggles) — before this fix the queue had no such
   filter at all, so a fresh session would have presented every already-curated record (~4,320,
   from `DOME_Top_Curate` etc.) for review alongside genuinely new bulk-matched candidates.
+  **Filterable + diversity-tracked** (`curate/bulk_scores.py`, extended `CurationSession`): the
+  queue can be filtered by BM25 match-score band, top journal, year range, and BM25
+  classification (each independently toggleable, joined from `bulk_candidates_scored.csv` at read
+  time without ever adding those columns to `canonical_dataset.csv`'s own schema), plus a live
+  "Diversity tracker" sidebar showing journal coverage % and per-journal/per-year positive/negative
+  counts — deliberately all-time/corpus-wide, not scoped to the active filter, and live-updating
+  from this session's in-memory decisions even before `curate materialize` runs. Also flags Step
+  14b's "needs screening" clear-negative candidates inline. `curate materialize` now upgrades a
+  reviewed record's `label_confidence` to `human_curated` on a clean decision (previously left it
+  at whatever it started as, e.g. `heuristic_candidate`, even after a human reviewed it).
 - TF-IDF + KeyBERT keyword extraction producing a scored keyword lexicon, seeded from
   `MLit-Triage-Nextflow/categorized_terms.csv`, with a `lexicon-stats` threshold tool and a real
   human review checkpoint (`src/dome_triage/keywords/`, `curate/term_review_state.py`,
@@ -109,9 +131,19 @@ Docker, README, AGENTS.md, CC BY 4.0 license, GitHub remote, CLI skeleton, confi
 - **Stratified sampling** (`src/dome_triage/sampling/`): match-score band × journal bucket ×
   year bucket, capped per stratum, feeding the curation queue with a diverse, sized-to-fit set
   rather than a raw score-cutoff dump.
-- **Clear-negative sampler** (`src/dome_triage/ingest/clear_negative_sampler.py`): random
-  narrow date-window sampling excluding AI/ML terms, since the bulk-match query structurally
-  cannot produce a true "no AI/ML mention at all" negative.
+- **Clear-negative sampler** (`src/dome_triage/ingest/clear_negative_sampler.py`): a **live Europe
+  PMC query** excluding AI/ML terms — the structural inverse of the bulk-match query (row 3 of the
+  checkpoint map above), genuinely disjoint from the 750k pool, not derived from it — since
+  bulk-match structurally cannot produce a true "no AI/ML mention at all" negative. Random
+  narrow date-window sampling, now **journal/year-stratified** (reuses
+  `sampling/stratified.py::build_strata`/`stratified_sample`) rather than plain-random, with a
+  `--merge-limit` option that phases how much of a diverse fetched pool actually lands in
+  `canonical_dataset.csv` per run — deliberate, since these candidates are stamped `label=
+  "negative"` at fetch time and an unphased merge could swing the dataset's raw pos/neg balance
+  sharply negative before any human review (see `STEPS_Progress.md` Step 14 for the arithmetic).
+  **Strong-negative screening** (`step_ingest_screen_clear_negatives`, Step 14b): re-scores the
+  fetched pool against the same promoted lexicon/threshold the AI/ML pool uses, flagging (never
+  auto-rejecting) any candidate that scores suspiciously high despite the exclusion query.
 - **Provenance ledger** (`src/dome_triage/provenance.py`): every step appends a record to
   `data/provenance.jsonl` (git commit, exact inputs/outputs with row counts and hashes, params,
   duration) and prints the same as a human-readable summary — no generated file exists without

@@ -14,6 +14,11 @@ services:
       # Read-only access to the sibling repos referenced by absolute paths in configs/sources.yaml
       - /home/gavinfarrell/PhD_Code:/home/gavinfarrell/PhD_Code:ro
     working_dir: /app
+    # Backstop, same reasoning as `pipeline`'s mem_limit below -- the Curate app's diversity
+    # filters (curate/bulk_scores.py) read bulk_candidates_scored.csv (~1.7GB) via a narrow
+    # usecols=[...] read that should never need anywhere near this much memory, but a hard cap
+    # here means a bug in that path gets contained to this container, not the host.
+    mem_limit: 12g
 
   pipeline:
     build:

@@ -842,8 +842,21 @@ def step_sampling_stratify(cfg: PipelineConfig) -> None:
 
 
 def step_ingest_fetch_clear_negatives(
-    cfg: PipelineConfig, year_from: int, year_to: int, sample_size: int
+    cfg: PipelineConfig,
+    year_from: int,
+    year_to: int,
+    sample_size: int,
+    merge_limit: int | None = None,
+    n_windows: int = 40,
 ) -> None:
+    """`sample_size` controls the full diverse pool built and written to disk (cheap -- an interim
+    file, no canonical impact by itself). `merge_limit` (defaults to `sample_size` if omitted)
+    caps how much of that pool actually merges into `canonical_dataset.csv` this run -- these
+    candidates are stamped `label="negative"` *at fetch time*, so an uncapped merge would push the
+    dataset's raw label balance sharply negative before any human review. Because the fetch is
+    deterministically seeded, re-running with a higher `--merge-limit` refetches the *same* pool
+    and the existing dedup-by-ID merge logic pulls in only the incremental delta -- phased merging
+    for free. See STEPS_Progress.md Step 14 for the worked ratio arithmetic."""
     started_at = time.monotonic()
     epmc_cfg = cfg.sources.get("epmc", {})
     client = EpmcClient(
@@ -853,7 +866,7 @@ def step_ingest_fetch_clear_negatives(
         backoff_factor=epmc_cfg.get("backoff_factor", 1.5),
     )
     try:
-        df = fetch_clear_negatives(client, year_from, year_to, sample_size)
+        df = fetch_clear_negatives(client, year_from, year_to, sample_size, n_windows=n_windows)
     finally:
         client.close()
 
@@ -861,15 +874,98 @@ def step_ingest_fetch_clear_negatives(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_path, index=False)
 
-    new_records = dataframe_to_raw_records(df)
+    merge_limit = sample_size if merge_limit is None else merge_limit
+    to_merge = df if len(df) <= merge_limit else df.sample(n=merge_limit, random_state=42)
+    print(f"ingest.fetch-clear-negatives: merging up to {merge_limit} of the {len(df)}-row pool "
+          f"({len(to_merge)} selected) into canonical_dataset.csv...")
+
+    new_records = dataframe_to_raw_records(to_merge)
     n_added = _merge_new_candidates_into_canonical(cfg, new_records)
+
+    canonical_path = cfg.path("canonical_dataset")
+    if canonical_path.exists():
+        label_counts = pd.read_csv(canonical_path, dtype=str)["label"].value_counts()
+        n_pos, n_neg = int(label_counts.get("positive", 0)), int(label_counts.get("negative", 0))
+        ratio = f"{n_neg / n_pos:.2f}:1" if n_pos else "n/a"
+        print(f"ingest.fetch-clear-negatives: canonical_dataset.csv is now {n_pos} positive / "
+              f"{n_neg} negative (ratio {ratio}) -- watch this before increasing --merge-limit "
+              "in a later round.")
 
     finish_step(
         "ingest.fetch-clear-negatives",
         inputs=[],
         outputs=[output_path],
-        params={"year_from": year_from, "year_to": year_to, "sample_size": sample_size},
-        notes=f"{len(df)} sampled, {n_added} new records merged into canonical_dataset.csv for curation",
+        params={
+            "year_from": year_from,
+            "year_to": year_to,
+            "sample_size": sample_size,
+            "merge_limit": merge_limit,
+            "n_windows": n_windows,
+        },
+        notes=f"{len(df)} diverse candidates fetched (journal/year-stratified), {n_added} new "
+        f"records merged into canonical_dataset.csv for curation (merge capped at {merge_limit})",
+        started_at=started_at,
+    )
+
+
+def step_ingest_screen_clear_negatives(cfg: PipelineConfig) -> None:
+    """"Strong negative" screening (Step 14b): re-scores clear_negative_candidates.csv (fetched
+    specifically for NOT mentioning AI/ML terms) against the *same* promoted lexicon Step 12
+    already scores the AI/ML-matched pool with. A candidate that still scores at/above the
+    already-validated Youden threshold despite lacking the literal AI/ML phrase is worth a second
+    look before trusting it as a genuine negative -- flagged, not auto-rejected; the actual call
+    stays a human one in the Curate app (see curate/bulk_scores.py + pages/1_Curate.py's
+    needs_screening handling). Small-scale reuse of exactly what step_keywords_score_bulk_match
+    already does (same scorer, same threshold lookup) -- at up to ~10k rows this finishes in well
+    under a minute, no chunking/checkpointing needed at that scale."""
+    started_at = time.monotonic()
+    candidates_path = cfg.sampling_path("clear_negative_candidates")
+    if not candidates_path.exists():
+        raise ValueError(f"{candidates_path} does not exist -- run `ingest fetch-clear-negatives` first.")
+    candidates = pd.read_csv(candidates_path, dtype=str)
+    texts = (candidates["title"].fillna("") + ". " + candidates["abstract"].fillna("")).tolist()
+
+    lexicon_path = cfg.path("processed_dir") / "keyword_lexicon.csv"
+    lexicon_terms, _ = load_lexicon_terms_and_weights(pd.read_csv(lexicon_path))
+
+    exclusionary_path = resolve_path(cfg.pipeline["keywords"]["exclusionary_lexicon"])
+    exclusionary_terms: list[str] = []
+    if exclusionary_path.exists():
+        exclusionary_terms, _ = load_lexicon_terms_and_weights(pd.read_csv(exclusionary_path))
+    condition = "positive_plus_exclusionary_lexicon" if exclusionary_terms else "positive_lexicon_only"
+
+    print(f"screen-clear-negatives: scoring {len(candidates)} candidates against the lexicon...")
+    scored = SCORERS["bm25"]().score_corpus(
+        texts, lexicon_terms, exclusionary_terms=exclusionary_terms or None
+    )
+    candidates["lexicon_score__bm25"] = [s for s, _ in scored]
+
+    bakeoff_report_path = cfg.path("processed_dir") / "scoring_bakeoff_report.csv"
+    threshold = _lookup_youden_threshold(bakeoff_report_path, "bm25", condition)
+    if threshold is None:
+        candidates["needs_screening"] = False
+        print("screen-clear-negatives: no validated Youden threshold found -- run "
+              "`keywords scoring-bakeoff` first; all candidates left unflagged for now.")
+    else:
+        candidates["needs_screening"] = candidates["lexicon_score__bm25"] >= threshold
+        n_flagged = int(candidates["needs_screening"].sum())
+        print(f"screen-clear-negatives: {n_flagged}/{len(candidates)} flagged for extra scrutiny "
+              f"(scored >= {threshold:.1f}, the validated bm25/{condition} threshold) despite "
+              "the AI/ML exclusion query used to fetch them.")
+
+    output_path = cfg.sampling_path("clear_negative_candidates_screened")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    candidates.to_csv(output_path, index=False)
+
+    finish_step(
+        "ingest.screen-clear-negatives",
+        inputs=[candidates_path, lexicon_path]
+        + ([exclusionary_path] if exclusionary_terms else [])
+        + ([bakeoff_report_path] if threshold is not None else []),
+        outputs=[output_path],
+        params={"condition": condition, "threshold": threshold},
+        notes=f"{len(candidates)} candidates screened"
+        + (f"; {int(candidates['needs_screening'].sum())} flagged" if threshold is not None else "; none flagged (no threshold available)"),
         started_at=started_at,
     )
 

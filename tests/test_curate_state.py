@@ -204,7 +204,36 @@ def test_materialize_events_applies_decision_when_no_conflict(tmp_path):
 
     assert result.loc[0, "label"] == "positive"
     assert result.loc[0, "has_conflict"] == "False"
+    assert result.loc[0, "label_confidence"] == "human_curated"
     assert json.loads(result.loc[0, "curation_features"]) == {"applies_ml_to_data": True}
+
+
+def test_materialize_events_upgrades_heuristic_candidate_confidence_on_review(tmp_path):
+    # The exact real-world case this exists for: a bulk-match/clear-negative candidate merged in
+    # at heuristic_candidate confidence, then a human actually reviews it via the app -- that
+    # review must count as a real human judgment, not stay stuck at the original heuristic tier.
+    dataset_path = _write_canonical_dataset_with_label(
+        tmp_path / "canonical_dataset.csv", label="negative", label_confidence="heuristic_candidate"
+    )
+    events_path = tmp_path / "curation_events.csv"
+    pd.DataFrame(
+        [
+            {
+                "record_id": "rec1",
+                "decision": "negative",
+                "tag": "",
+                "notes": "",
+                "features": "",
+                "curator": "alice",
+                "timestamp": "2026-01-01T00:00:00+00:00",
+            }
+        ]
+    ).to_csv(events_path, index=False)
+
+    result = materialize_events(dataset_path, events_path, tmp_path / "canonical_dataset.csv")
+
+    assert result.loc[0, "label"] == "negative"
+    assert result.loc[0, "label_confidence"] == "human_curated"
 
 
 def test_materialize_events_flags_conflict_with_trusted_prior_label(tmp_path):
@@ -233,6 +262,8 @@ def test_materialize_events_flags_conflict_with_trusted_prior_label(tmp_path):
 
     assert result.loc[0, "label"] == "conflict"
     assert result.loc[0, "has_conflict"] == "True"
+    # already trusted-tier -- that's what made it a conflict; nothing to upgrade, must stay put.
+    assert result.loc[0, "label_confidence"] == "human_curated"
 
 
 def test_materialize_events_flags_conflict_when_undeterminable_contradicts_trusted_prior(tmp_path):
@@ -256,3 +287,136 @@ def test_materialize_events_flags_conflict_when_undeterminable_contradicts_trust
 
     result = materialize_events(dataset_path, events_path, tmp_path / "canonical_dataset.csv")
     assert result.loc[0, "label"] == "conflict"
+
+
+def _write_dataset_for_filters(path):
+    df = pd.DataFrame(
+        {
+            "record_id": ["rec1", "rec2", "rec3", "rec4"],
+            "title": ["P1", "P2", "P3", "P4"],
+            "abstract": ["a", "b", "c", "d"],
+            "journal": ["Nature", "Nature", "Science", "Obscure Journal"],
+            "year": ["2018", "2022", "2020", "2015"],
+            "label": ["unlabeled"] * 4,
+            "label_confidence": ["unscored"] * 4,
+            "pmcid": ["PMC1", "PMC2", "PMC3", "PMC4"],
+            "pmid": ["", "", "", ""],
+            "doi": ["", "", "", ""],
+        }
+    )
+    df.to_csv(path, index=False)
+    return path
+
+
+_FILTER_SCORE_LOOKUP = {
+    "PMC1": (10.0, "negative"),
+    "PMC2": (200.0, "positive"),
+    "PMC3": (150.0, "positive"),
+    "PMC4": (5.0, "negative"),
+}
+_FILTER_SCREENING_LOOKUP = {"PMC1": True, "PMC2": False, "PMC3": False, "PMC4": False}
+
+
+def test_classification_filter_restricts_queue(tmp_path):
+    dataset_path = _write_dataset_for_filters(tmp_path / "canonical_dataset.csv")
+    session = CurationSession(
+        dataset_path=dataset_path,
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+        bulk_score_lookup=_FILTER_SCORE_LOOKUP,
+        classification=["positive"],
+    )
+    assert set(session.queue) == {"rec2", "rec3"}
+
+
+def test_year_range_filter_restricts_queue(tmp_path):
+    dataset_path = _write_dataset_for_filters(tmp_path / "canonical_dataset.csv")
+    session = CurationSession(
+        dataset_path=dataset_path,
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+        year_range=(2019, 2022),
+    )
+    assert set(session.queue) == {"rec2", "rec3"}  # 2022 and 2020; 2018/2015 excluded
+
+
+def test_journal_filter_uses_top_n_bucketing(tmp_path):
+    # top_n_journals=1 -- only "Nature" (2 occurrences) keeps its own name, Science/Obscure
+    # (1 each) both collapse to "other". Chosen specifically to avoid a tie at the cutoff rank.
+    dataset_path = _write_dataset_for_filters(tmp_path / "canonical_dataset.csv")
+    session = CurationSession(
+        dataset_path=dataset_path,
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+        journals=["Nature"],
+        top_n_journals=1,
+    )
+    assert set(session.queue) == {"rec1", "rec2"}
+
+    other_session = CurationSession(
+        dataset_path=dataset_path,
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+        journals=["other"],
+        top_n_journals=1,
+    )
+    assert set(other_session.queue) == {"rec3", "rec4"}
+
+
+def test_score_band_filter_splits_high_and_low(tmp_path):
+    dataset_path = _write_dataset_for_filters(tmp_path / "canonical_dataset.csv")
+    session = CurationSession(
+        dataset_path=dataset_path,
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+        bulk_score_lookup=_FILTER_SCORE_LOOKUP,
+        score_band=[1],  # top half: 150.0, 200.0 -> rec2, rec3
+        n_score_bands=2,
+    )
+    assert set(session.queue) == {"rec2", "rec3"}
+
+
+def test_needs_screening_only_filter(tmp_path):
+    dataset_path = _write_dataset_for_filters(tmp_path / "canonical_dataset.csv")
+    session = CurationSession(
+        dataset_path=dataset_path,
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+        screening_lookup=_FILTER_SCREENING_LOOKUP,
+        needs_screening_only=True,
+    )
+    assert set(session.queue) == {"rec1"}
+
+
+def test_diversity_stats_counts_trusted_prior_labels(tmp_path):
+    dataset_path = _write_dataset_with_mixed_trust(tmp_path / "canonical_dataset.csv")
+    session = CurationSession(dataset_path=dataset_path, events_path=tmp_path / "events.csv", curator="alice")
+
+    stats = session.diversity_stats()
+
+    # rec1 (human_curated positive, J1) and rec2 (registry_confirmed negative, J2) count;
+    # rec3 (heuristic_candidate, unreviewed) does not, even though its label is "positive".
+    assert stats["n_journals_covered"] == 2
+    assert stats["n_journals_total"] == 4
+    assert stats["per_journal_counts"].loc["J1", "positive"] == 1
+    assert stats["per_journal_counts"].loc["J2", "negative"] == 1
+    assert "J3" not in stats["per_journal_counts"].index
+
+
+def test_diversity_stats_reflects_live_session_decisions_before_materialize(tmp_path):
+    # rec3 starts as heuristic_candidate/positive (not yet "confirmed") -- deciding it via the
+    # app in THIS session must move the dashboard immediately, without running curate materialize.
+    dataset_path = _write_dataset_with_mixed_trust(tmp_path / "canonical_dataset.csv")
+    session = CurationSession(
+        dataset_path=dataset_path, events_path=tmp_path / "events.csv", curator="alice"
+    )
+    before = session.diversity_stats()
+    assert "J3" not in before["per_journal_counts"].index
+
+    while session.current_record() is not None and session.current_record()["record_id"] != "rec3":
+        session.record_decision("skipped")
+    session.record_decision("negative")  # decide rec3
+
+    after = session.diversity_stats()
+    assert after["per_journal_counts"].loc["J3", "negative"] == 1
+    assert after["n_journals_covered"] == before["n_journals_covered"] + 1

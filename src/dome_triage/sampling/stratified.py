@@ -12,14 +12,19 @@ import pandas as pd
 
 def build_strata(
     df: pd.DataFrame,
-    score_col: str,
+    score_col: str | None,
     n_score_bands: int = 4,
     top_n_journals: int = 15,
     year_bucket_width: int = 5,
 ) -> pd.DataFrame:
+    """`score_col=None` skips the score-band column entirely -- for pools with no meaningful
+    score to band by (e.g. clear-negative candidates, which are explicitly selected for *not*
+    matching the lexicon at all, so a lexicon-derived band would be meaningless). Journal/year
+    bucketing applies either way."""
     df = df.copy()
-    band_col = f"match_score_band__{score_col}"
-    df[band_col] = pd.qcut(df[score_col], q=n_score_bands, labels=False, duplicates="drop")
+    if score_col is not None:
+        band_col = f"match_score_band__{score_col}"
+        df[band_col] = pd.qcut(df[score_col], q=n_score_bands, labels=False, duplicates="drop")
 
     top_journals = df["journal"].value_counts().head(top_n_journals).index
     df["journal_bucket"] = df["journal"].where(df["journal"].isin(top_journals), "other")

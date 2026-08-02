@@ -8,6 +8,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 import typer
 
@@ -194,13 +195,31 @@ def ingest_fetch_clear_negatives(
     year_from: int = typer.Option(..., "--year-from"),
     year_to: int = typer.Option(..., "--year-to"),
     sample_size: int = typer.Option(2000, "--sample-size"),
+    merge_limit: Optional[int] = typer.Option(
+        None,
+        "--merge-limit",
+        help="Caps how many of the sample-size pool actually merge into canonical_dataset.csv "
+        "this run (defaults to sample_size). Keeps the raw label balance from swinging sharply "
+        "negative before human review -- see STEPS_Progress.md Step 14.",
+    ),
+    n_windows: int = typer.Option(40, "--n-windows"),
     config_dir: str = _CONFIG_DIR_OPTION,
 ) -> None:
-    """Samples genuine AI/ML-free negatives (random narrow date windows) -- merges into
-    canonical_dataset.csv for the curation app's queue, same as sampling stratify."""
+    """Samples genuine AI/ML-free negatives (live EPMC query, the inverse of bulk-match's AI/ML
+    query -- see clear_negative_sampler.py), journal/year-stratified -- merges up to --merge-limit
+    into canonical_dataset.csv for the curation app's queue, same as sampling stratify."""
     pipeline_steps.step_ingest_fetch_clear_negatives(
-        _load_config(config_dir), year_from, year_to, sample_size
+        _load_config(config_dir), year_from, year_to, sample_size, merge_limit, n_windows
     )
+
+
+@ingest_app.command("screen-clear-negatives")
+def ingest_screen_clear_negatives(config_dir: str = _CONFIG_DIR_OPTION) -> None:
+    """Step 14b: re-scores clear_negative_candidates.csv against the promoted lexicon (same
+    scorer + Youden threshold Step 12 already validated) and flags any that score suspiciously
+    high despite the AI/ML exclusion query -- surfaced in the Curate app for extra scrutiny
+    before you trust them as genuine negatives."""
+    pipeline_steps.step_ingest_screen_clear_negatives(_load_config(config_dir))
 
 
 @curate_app.command("launch")

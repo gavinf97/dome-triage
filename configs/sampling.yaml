@@ -17,3 +17,4 @@ paths:
   stratified_candidate_pool: data/processed/stratified_candidate_pool.csv
   stratum_report: data/processed/stratum_report.csv
   clear_negative_candidates: data/interim/clear_negative_candidates.csv
+  clear_negative_candidates_screened: data/interim/clear_negative_candidates_screened.csv

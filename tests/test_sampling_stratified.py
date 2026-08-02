@@ -45,3 +45,26 @@ def test_stratified_sample_report_reflects_actual_availability():
     _, report = stratified_sample(strata_df, strata_cols, cap_per_stratum=100)
     # cap far exceeds availability -- sampled should equal available, not the cap
     assert (report["sampled"] == report["available"]).all()
+
+
+def test_build_strata_with_score_col_none_skips_score_band_column():
+    # clear-negative candidates have no meaningful lexicon score to band by -- score_col=None
+    # must skip that column entirely rather than erroring, while journal/year bucketing still work.
+    df = _synthetic_df()
+    strata_df = build_strata(df, score_col=None, top_n_journals=2, year_bucket_width=5)
+
+    assert not any(col.startswith("match_score_band__") for col in strata_df.columns)
+    assert "journal_bucket" in strata_df.columns
+    assert "year_bucket" in strata_df.columns
+
+
+def test_stratified_sample_works_with_journal_year_only_strata():
+    df = _synthetic_df()
+    strata_df = build_strata(df, score_col=None, top_n_journals=4, year_bucket_width=5)
+    strata_cols = ["journal_bucket", "year_bucket"]
+
+    sampled, report = stratified_sample(strata_df, strata_cols, cap_per_stratum=2)
+
+    counts = sampled.groupby(strata_cols).size()
+    assert (counts <= 2).all()
+    assert (report["sampled"] <= report["available"]).all()

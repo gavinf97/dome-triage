@@ -36,16 +36,18 @@ section rather than repeating it.
 
 ---
 
-## Status snapshot (verified 2026-07-31, updated after Step 8's keyword lexicon curation)
+## Status snapshot (verified 2026-08-02, updated after Step 13's real run)
 
 | Phase | State |
 |---|---|
 | Phase 0 — repo scaffold | ✅ Done |
-| Phase 1 — data consolidation → curation | 🟡 Consolidation + keyword lexicon (Steps 1–8d, incl. a real curation round and the 3-tier lexicon system) done; bulk-match, scoring-bakeoff, sampling, clear-negatives, and the paper-level curation session (Steps 9–16) are **not yet run** |
+| Phase 1 — data consolidation → curation | 🟡 Steps 1–13 done (incl. the keyword lexicon, the full BM25 bulk-match/score/stratify pipeline, and the Curate app's new filters + diversity dashboard). Step 14/14b (clear negatives + screening) built and tested but not yet fired live — deliberately left for you to trigger when ready (see Step 14). Step 15 (human curation) is open and ready to start. |
 | Phases 2–8 (EDAM tagging, classifiers, calibration, bulk scan, daily pipeline) | ⬜ Not implemented — no code exists yet beyond stub `__init__.py` files. Nothing to run here; see the closing section. |
 
-Canonical dataset right now: **4,329 records** (`data/processed/canonical_dataset.csv`), with
-**9 flagged conflicts** awaiting resolution (`data/processed/conflicts_for_review.csv`).
+Canonical dataset right now: **6,647 records** (`data/processed/canonical_dataset.csv`) — the
+original 4,320 plus **2,327 new BM25-matched candidates** merged in by Step 13, all `unlabeled`
+and ready for the Curate app's queue. **9 flagged conflicts** still awaiting resolution
+(`data/processed/conflicts_for_review.csv`).
 
 Keyword lexicon right now (see Steps 8–8d): a real 500-decision curation round is done
 (314 positive / 5 negative / 181 irrelevant), plus a curated batch of ML/AI terms I (Claude) added
@@ -767,25 +769,23 @@ that mechanism already existed (`_merge_new_candidates_into_canonical`), it just
 until Step 12's new `already_curated` column made it so.
 
 **Once merged, review via the existing Curate app** (`docker compose up curate` → "Curate" page)
-— same interface as before, now with two new toggles at the top:
-- **"Include already-curated records (redo / re-review)"** — off by default. **Real fix, not just
-  a nice-to-have**: before this, the Curate app's queue had *no filter at all* for already-labeled
-  records — opening it fresh would have presented all ~4,320 already-curated
-  `human_curated`/`registry_confirmed` records (from `DOME_Top_Curate` etc.) for review alongside
-  genuinely new ones. Now those are excluded by default (they're settled ground truth), and this
-  toggle lets you deliberately re-review them if you want to.
-- **"Only show records with full text available (has PMCID)"** — off by default, filters the
-  queue to `pmcid`-having records only.
+— now with filterable access to the BM25-scored pool (score band / top journal / year / BM25
+classification, each independently toggleable) and a live diversity dashboard, on top of the two
+existing toggles (include-already-labeled, require-PMCID). Full detail in **Step 15a** below rather
+than duplicated here — this is where you'll actually use them.
 
 **Validate before continuing:** Row count of `stratified_candidate_pool.csv` is in the expected
 ballpark for your `cap_per_stratum`. Check `stratum_report.csv` for any wildly underfilled strata.
 
 **Log:**
-- [ ] Run on: __________
-- `cap_per_stratum` used: __________
-- Candidates produced: __________
-- New records actually merged into `canonical_dataset.csv` (vs. already-present, per the step's
-  printed summary): __________
+- [x] Run on: 2026-08-02 (duration 18.5s)
+- `cap_per_stratum` used: 10 (default, unchanged)
+- Candidates produced: **2,328** (`stratified_candidate_pool.csv`), across **252** stratum
+  combinations (`stratum_report.csv`) — somewhat below the ~3,000-3,200 theoretical estimate,
+  expected since real availability per stratum varies (some journal x year x score-band
+  combinations simply don't have 10 candidates).
+- New records actually merged into `canonical_dataset.csv`: **2,327** (1 was already present).
+  `canonical_dataset.csv` grew from 4,320 to **6,647** rows.
 - Decision/notes: __________
 
 ---
@@ -793,37 +793,105 @@ ballpark for your `cap_per_stratum`. Check `stratum_report.csv` for any wildly u
 ## Step 14 — Fetch clear negatives
 
 **What's happening / why:** The bulk-match query (Step 9) structurally can't produce a true "no
-AI/ML mention at all" negative — it only ever matches AI/ML papers. This step randomly samples
-from narrow date windows *excluding* AI/ML terms, giving the classifier genuine negative
-examples later.
+AI/ML mention at all" negative — it only ever matches AI/ML papers. This step queries **live
+Europe PMC directly** (not the local 750k pool) for the *inverse*: `EXCLUDE_QUERY` in
+`src/dome_triage/ingest/clear_negative_sampler.py` requires the **absence** of "artificial
+intelligence"/"machine learning"/"deep learning"/"neural network", the structural opposite of Step
+9's `bulk_match.py::AI_ML_QUERY`. Every record here is independently confirmed by EPMC's own
+search to not mention those terms — genuinely disjoint from the 750k pool by construction, not a
+downsample or filter of it.
 
-**Command** (year range and sample size are your call — README's example below; CLI default
-`--sample-size` is 2000 if omitted):
+As of this rewrite: (1) the fetched pool is now **journal/year-stratified** (reusing
+`sampling/stratified.py`'s `build_strata`/`stratified_sample` — the same tested bucketing Step 13
+uses) rather than a plain random downsample, so it's diverse across journals and years, not just
+whatever the random date windows happened to catch; (2) a new **`--merge-limit`** option separates
+"how big a diverse pool to build" from "how much of it actually lands in `canonical_dataset.csv`
+this run" — see the ratio arithmetic below for why that split matters.
+
+**Class-imbalance arithmetic, worth reading before choosing numbers**: `clear_negative_sampler`
+stamps `label="negative"` *at fetch time* — the moment a batch merges into
+`canonical_dataset.csv`, that count lands in the `label` column, before any human review. Current
+canonical dataset (pre-Step-14): **1,878 positive / 1,907 negative** (~1:1). Auto-merging a full
+10k batch in one shot would push that to ~11,907 negative vs 1,878 positive (≈6.3:1) — genuinely
+too skewed: at that ratio a classifier can shortcut to "always predict negative" and still score
+well on raw accuracy. Recommended starting point: **`--sample-size 10000 --merge-limit 2000`** —
+builds the full diverse ~10k pool (cheap, just an interim file) but merges only ~2,000 into the
+canonical dataset this round, landing at ≈2.1:1. That's a deliberate middle point, not just
+"smaller than 6.3:1": a mild negative skew (roughly 1.5:1–2.5:1) is standard for a triage
+classifier like this and *helps* it, since the true prevalence of AI/ML-methods papers across all
+of EPMC is itself well below 50% — a naive 1:1 balance would miscalibrate the model for what it'll
+actually see in production. Because the fetch is deterministically seeded, re-running with a
+higher `--merge-limit` refetches the *same* pool and the existing dedup-by-ID merge logic pulls in
+only the incremental delta — phased merging for free; watch the live ratio (Step 15a's diversity
+dashboard, or the printed summary after each run) before increasing it.
+
+**Command:**
 ```bash
-docker compose run --rm pipeline dome-triage ingest fetch-clear-negatives --year-from 2015 --year-to 2025
+docker compose run --rm pipeline dome-triage ingest fetch-clear-negatives --year-from 2015 --year-to 2025 --sample-size 10000 --merge-limit 2000
 ```
 
-**Expected output:** `data/interim/clear_negative_candidates.csv` — **~1,500–2,000 candidates
-expected** per `ROADMAP.md`'s worked example (with default `--sample-size 2000`). Merged into
-`canonical_dataset.csv`'s curation queue, same as Step 13.
+**Expected output:** `data/interim/clear_negative_candidates.csv` — the full diverse pool
+(~`--sample-size` rows, journal/year-stratified). Up to `--merge-limit` of it merged into
+`canonical_dataset.csv`'s curation queue, same mechanism as Step 13. The step prints the raw
+pre-stratification count, the stratum report, and the resulting canonical pos/neg ratio — read all
+three before deciding on a second round.
 
 **Validate before continuing:** Row count matches roughly what you asked for; spot-check a few
-titles/abstracts to confirm they genuinely don't mention AI/ML.
+titles/abstracts to confirm they genuinely don't mention AI/ML; check the printed post-merge ratio
+isn't wildly more skewed than you intended.
 
 **Log:**
 - [ ] Run on: __________
-- Year range / sample size used: __________
-- Candidates produced: __________
+- Year range / sample-size / merge-limit used: __________
+- Candidates produced (full pool) / merged (canonical): __________
+- Resulting canonical pos/neg ratio (from the printed summary): __________
+- Decision/notes: __________
+
+---
+
+## Step 14b — Screen clear negatives against the lexicon ("strong negative" check)
+
+**What's happening / why:** A "clear negative" was fetched specifically for **not** containing the
+literal phrase "artificial intelligence"/"machine learning" — but a paper can discuss ML concepts
+(algorithms, classifiers, predictive models) without ever using those exact phrases. This step
+re-scores `clear_negative_candidates.csv` against the *same* promoted lexicon and *same*
+Youden threshold Step 12 already validated for the AI/ML pool (`Bm25Scorer`, reused directly —
+`src/dome_triage/pipeline/steps.py::step_ingest_screen_clear_negatives`) — anything that still
+scores at/above that threshold despite the exclusion query is flagged `needs_screening=True`, a
+signal worth a closer look before trusting it as a genuine negative. **Flags, never auto-rejects**
+— the actual call stays a human one in the Curate app (Step 15a).
+
+**Command** (run after Step 14; needs Step 11's `scoring_bakeoff_report.csv` for the threshold):
+```bash
+docker compose run --rm pipeline dome-triage ingest screen-clear-negatives
+```
+
+**Expected output:** `data/interim/clear_negative_candidates_screened.csv` — same rows as
+`clear_negative_candidates.csv` plus `lexicon_score__bm25`/`needs_screening`. Never overwrites the
+raw candidates file (mirrors the `bulk_candidates.csv` → `bulk_candidates_scored.csv` convention).
+At ≤10k rows this finishes in well under a minute — no chunking/checkpointing needed at this scale.
+
+**Validate before continuing:** Read the printed flagged count/percentage — spot-check a few
+flagged titles/abstracts yourself to sanity-check the flag is catching genuinely borderline cases,
+not just noise.
+
+**Log:**
+- [ ] Run on: __________
+- Candidates screened / flagged: __________
 - Decision/notes: __________
 
 ---
 
 ## Step 15 — Human curation session
 
-**What's happening / why:** This is the real manual labor step. At `cap_per_stratum=10` plus the
-clear-negative sample, expect roughly **4,500–5,000 new papers** queued, at a realistic
-20–40 seconds per quick title/abstract/MeSH decision — **~25–55 hours total**, doable across many
-sessions (the app resumes exactly where you left off; nothing is lost between sessions).
+**What's happening / why:** This is the real manual labor step. At `cap_per_stratum=10` (Step 13)
+plus a ~2,000-record clear-negative merge (Step 14, `--merge-limit 2000`), expect roughly
+**5,000-5,200 new papers** queued — see `ROADMAP.md`'s "Curation workload estimate" for the
+updated arithmetic (Step 13's real pool is 745k, not the ~5-10k originally envisioned, though the
+strata-driven queue size itself doesn't scale with pool size). At a realistic 20-40 seconds per
+quick title/abstract/MeSH decision — **~28-58 hours total**, doable across many sessions (the app
+resumes exactly where you left off; nothing is lost between sessions). Use Step 15a's new filters
+to work through it in whatever diverse order suits you, not necessarily top-to-bottom.
 
 **Command:**
 ```bash
@@ -832,6 +900,36 @@ docker compose up curate
 ```
 
 ### 15a — Curate page (main queue)
+
+**Filters (collapsed "Filters" expander at the top, on/off toggleable, composable)** — join
+`bulk_candidates_scored.csv`'s BM25 score/classification onto the queue at read time
+(`src/dome_triage/curate/bulk_scores.py`; `canonical_dataset.csv` itself never gains these
+columns, same reasoning as Step 12's `already_curated`):
+- **Match-score band** — quartiles of `match_score__bm25`, computed fresh over whatever's
+  currently in the queue (not Step 13's original 745k-pool-wide bands, which would be less useful
+  once the queue is already a small, pre-stratified subset).
+- **Journal** — top-N by volume (same bucketing Step 13 uses), or `other` for everything else.
+- **Year** — one range slider; collapse both handles to the same year to pick a single year.
+- **BM25 classification** — positive/negative, straight from Step 12.
+- **Needs-screening-only** — Step 14b's flagged clear-negatives, for batch-reviewing them together.
+
+**Diversity tracker (sidebar, "Diversity tracker" expander)** — deliberately **all-time/
+corpus-wide, not scoped to whatever filter is active** (a decision's diversity contribution
+doesn't depend on which lens you were viewing it through when you made it — same reasoning as
+`term_review_state.py`'s `all_time_counts()`). Shows journal coverage % (journals with at least
+one *confirmed* positive/negative decision, out of all journals in the dataset), a per-year
+positive/negative bar chart, and a per-journal table. "Confirmed" means trusted `label_confidence`
+**or** decided in *this session's* events — so a decision you make right now moves the dashboard
+immediately, without needing to run Step 16 first; a freshly-merged, not-yet-reviewed
+`heuristic_candidate` batch (e.g. right after Step 14) does *not* inflate coverage before a human
+actually looked at it. When a single journal is selected via the filter, that journal's own tally
+also shows directly on the page, not just in the sidebar.
+
+**Note**: as of this rewrite, `curate materialize` (Step 16) now upgrades a reviewed record's
+`label_confidence` to `human_curated` (previously it only updated `label`, leaving confidence at
+whatever it started as) — so a record that was `heuristic_candidate` before you decided it becomes
+fully trusted once materialized, same as any other human-curated source.
+
 One paper at a time: title/journal/year/MeSH/abstract shown, plus the structured feature
 checklist from `configs/curation_features.yaml`:
 - Applies ML/AI to empirical data? (bool)
