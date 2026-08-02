@@ -1,11 +1,13 @@
 """Main Positive/Negative/Undeterminable/Skip curation queue -- ports curation.ipynb's
 CurationInterface interaction pattern (see curate/state.py) into a Streamlit page.
 
-The decision radio lives OUTSIDE the form so picking it reruns the page immediately -- needed so
-`close_negative_reason` (configs/curation_features.yaml) only appears once "negative" is picked.
-Everything else (tag/notes/structured features/submit) lives inside one st.form so it submits
-atomically (Streamlit reruns the whole script per interaction, unlike ipywidgets' persistent
-callbacks, so batching avoids partial-state bugs).
+Keyboard-first by design (P/N/U/S submit and advance immediately -- no staged "pick a decision,
+then submit" step, since that's slower for the rapid-review workload this page exists for).
+Decision buttons use `on_click` callbacks (not a post-hoc `if button:` check) specifically because
+that's the only Streamlit-supported way to clear the Notes widget for the next record without
+hitting "cannot modify a widget after it's instantiated" -- callbacks run in a phase before the
+widget is re-instantiated on the next rerun. The keyboard-shortcut script below drives these same
+buttons by simulating a real DOM click, so it doesn't need its own Python-side handling at all.
 """
 
 from __future__ import annotations
@@ -16,7 +18,12 @@ import streamlit as st
 import yaml
 
 from dome_triage.config import resolve_path
-from dome_triage.curate.streamlit_helpers import get_filter_options, get_session
+from dome_triage.curate.streamlit_helpers import (
+    build_probe_session,
+    get_filter_options,
+    get_session,
+    get_youden_threshold,
+)
 
 st.set_page_config(page_title="Curate", layout="wide")
 st.title("Curate")
@@ -25,49 +32,26 @@ if not st.session_state.get("curator_name"):
     st.warning("Set your curator name on the Home page first.")
     st.stop()
 
-toggle_col1, toggle_col2 = st.columns(2)
-include_already_labeled = toggle_col1.checkbox(
-    "Include already-curated records (redo / re-review)",
-    value=False,
-    help="Off by default: records already trusted from a prior curation round "
-    "(label_confidence human_curated or registry_confirmed) are excluded from the queue -- "
-    "they're settled ground truth, not new. Turn on to deliberately re-review them anyway.",
-)
-require_pmcid = toggle_col2.checkbox(
-    "Only show records with full text available (has PMCID)",
-    value=False,
-)
+# ---------------------------------------------------------------------------------------------
+# Filters -- collapsed by default so the paper under review stays the focus; state persists once
+# you collapse it back down yourself.
+# ---------------------------------------------------------------------------------------------
+with st.expander("Filters", expanded=False):
+    toggle_col1, toggle_col2 = st.columns(2)
+    include_already_labeled = toggle_col1.checkbox(
+        "Also show already-curated records (from the ORIGINAL curation effort, for re-checking)",
+        value=False,
+        help="Off by default: records already trusted from a prior curation round -- "
+        "DOME_Top_Curate, the DOME registry, or a decision you already materialized through this "
+        "app -- are settled ground truth and excluded from the queue. Turn this on only if you "
+        "deliberately want to revisit and possibly change some of those original decisions.",
+    )
+    require_pmcid = toggle_col2.checkbox(
+        "Only show records with full text available (has PMCID)", value=False
+    )
 
-_N_SCORE_BANDS = 4
-_TOP_N_JOURNALS = 15
-_filter_options = get_filter_options(top_n_journals=_TOP_N_JOURNALS)
-
-with st.expander("Filters (diverse strata, top journals, year, BM25 classification)"):
-    f_col1, f_col2 = st.columns(2)
-    score_band = f_col1.multiselect(
-        "Match-score band (within the current queue)",
-        options=list(range(_N_SCORE_BANDS)),
-        format_func=lambda i: f"Q{i + 1}" + (" (highest)" if i == _N_SCORE_BANDS - 1 else " (lowest)" if i == 0 else ""),
-        help="Quartiles of match_score__bm25, computed fresh over whatever's currently in the "
-        "queue -- not replaying Step 13's original 745k-pool-wide bands, which would be less "
-        "useful once the queue is already a small, pre-stratified subset. Records with no BM25 "
-        "score at all (e.g. never went through Step 12) are excluded when this filter is active.",
-    )
-    journals = f_col2.multiselect(
-        "Journal (top journals by volume; select nothing for all)",
-        options=[*_filter_options["journals"], "other"],
-    )
-    f_col3, f_col4 = st.columns(2)
-    year_range = f_col3.slider(
-        "Year range",
-        min_value=_filter_options["year_min"],
-        max_value=_filter_options["year_max"],
-        value=(_filter_options["year_min"], _filter_options["year_max"]),
-        help="Collapse both handles to the same year to pick a single year.",
-    )
-    classification = f_col4.multiselect(
-        "BM25 classification",
-        options=["positive", "negative"],
+    classification = st.multiselect(
+        "BM25 classification (Step 12)", options=["positive", "negative"]
     )
     needs_screening_only = st.checkbox(
         "Only show clear-negative candidates flagged for extra scrutiny (Step 14b)",
@@ -75,6 +59,51 @@ with st.expander("Filters (diverse strata, top journals, year, BM25 classificati
         help="A 'clear negative' (fetched specifically for NOT mentioning AI/ML terms) that "
         "still scored above the validated lexicon threshold -- worth a closer look before "
         "trusting it as a genuine negative.",
+    )
+
+    # Probe session: same base filters as above, but never touches get_session()'s cache slot --
+    # only used to compute real score-range/curated-so-far numbers for the band widget's labels.
+    probe = build_probe_session(
+        include_already_labeled=include_already_labeled,
+        require_pmcid=require_pmcid,
+        classification=classification or None,
+        needs_screening_only=needs_screening_only,
+    )
+    band_summary = probe.score_band_summary()
+    _n_bands = len(band_summary)
+
+    def _format_band(band_idx: int) -> str:
+        info = next((b for b in band_summary if b["band"] == band_idx), None)
+        if info is None:
+            return f"Q{band_idx + 1}"
+        extreme = " (lowest)" if band_idx == 0 else " (highest)" if band_idx == _n_bands - 1 else ""
+        return (
+            f"Q{band_idx + 1}{extreme}: BM25 {info['min_score']:.1f}-{info['max_score']:.1f} "
+            f"-- {info['confirmed']}/{info['total']} curated"
+        )
+
+    score_band = st.multiselect(
+        "Match-score band (BM25)",
+        options=[b["band"] for b in band_summary],
+        format_func=_format_band,
+        help="Quartiles of match_score__bm25 (Q1 = lowest scores, Q4 = highest), computed fresh "
+        "over whatever the other filters above currently leave in the queue -- not replaying "
+        "Step 13's original 745k-pool-wide bands, which would be less useful now that the queue "
+        "is already a small, pre-stratified subset. 'X/Y curated' = how many of that band's "
+        "records already have a confirmed decision, out of the band's total.",
+    )
+
+    _filter_options = get_filter_options()
+    journals = st.multiselect(
+        "Journal (type to search -- every journal in the dataset, not just a top-N shortlist)",
+        options=_filter_options["journals"],
+    )
+    year_range = st.slider(
+        "Year range",
+        min_value=_filter_options["year_min"],
+        max_value=_filter_options["year_max"],
+        value=(_filter_options["year_min"], _filter_options["year_max"]),
+        help="Collapse both handles to the same year to pick a single year.",
     )
 
 session = get_session(
@@ -99,7 +128,11 @@ with st.sidebar.expander("Diversity tracker", expanded=False):
         st.bar_chart(stats["per_year_counts"])
     if not stats["per_journal_counts"].empty:
         st.caption("Positive/negative decisions by journal (top by volume)")
-        st.dataframe(stats["per_journal_counts"].sort_values(by=list(stats["per_journal_counts"].columns), ascending=False).head(20))
+        st.dataframe(
+            stats["per_journal_counts"]
+            .sort_values(by=list(stats["per_journal_counts"].columns), ascending=False)
+            .head(20)
+        )
 
 record = session.current_record()
 
@@ -107,13 +140,25 @@ if record is None:
     st.success("No records left to curate.")
     st.stop()
 
-st.caption(f"{session.remaining()} of {session.total()} remaining (this filtered view)")
+# ---------------------------------------------------------------------------------------------
+# Progress + navigation
+# ---------------------------------------------------------------------------------------------
+nav_prog, nav_back, nav_fwd = st.columns([6, 1, 1])
+nav_prog.caption(f"{session.remaining()} of {session.total()} remaining (this filtered view)")
+if nav_back.button("< Back", disabled=not session.can_go_back(), use_container_width=True):
+    session.go_back()
+    st.rerun()
+if nav_fwd.button("Forward >", disabled=not session.can_go_forward(), use_container_width=True):
+    session.go_forward()
+    st.rerun()
+
+prior_decision = session.current_record_prior_decision()
+if prior_decision:
+    st.info(f"You already marked this record **{prior_decision}** this session. Reviewing again.")
 
 if journals and len(journals) == 1:
-    # Direct, contextual feedback right where it matters -- about to decide on a paper from this
-    # journal, not buried in the sidebar.
     j = journals[0]
-    per_journal = session.diversity_stats()["per_journal_counts"]
+    per_journal = stats["per_journal_counts"]
     if j in per_journal.index:
         pos = int(per_journal.loc[j].get("positive", 0))
         neg = int(per_journal.loc[j].get("negative", 0))
@@ -128,10 +173,33 @@ if needs_screening:
         "AI/ML exclusion query used to fetch it -- double-check before confirming negative."
     )
 
-st.markdown(
-    f"### {record.get('title') or '(no title)'}", unsafe_allow_html=True
-)
-st.caption(f"{record.get('journal') or ''}  ·  {record.get('year') or ''}")
+# ---------------------------------------------------------------------------------------------
+# Paper display
+# ---------------------------------------------------------------------------------------------
+st.markdown(f"### {record.get('title') or '(no title)'}", unsafe_allow_html=True)
+
+meta_col1, meta_col2 = st.columns(2)
+meta_col1.markdown(f"**Journal:** {record.get('journal') or '(unknown)'}", unsafe_allow_html=True)
+meta_col2.markdown(f"**Year:** {record.get('year') or '(unknown)'}")
+
+bm25_score = record.get("bulk_match_score")
+bm25_classification = record.get("bulk_match_classification")
+if bm25_score not in (None, "", "nan") and str(bm25_score) != "nan":
+    threshold = get_youden_threshold()
+    threshold_text = (
+        f"Classified **{bm25_classification or '(unscored)'}** because the score is "
+        f"{'>=' if bm25_classification == 'positive' else '<'} the validated Youden threshold "
+        f"of {threshold:.1f} (Step 11's bake-off, bm25 + exclusionary lexicon). Higher score = "
+        "stronger lexicon match; this is a ranking signal to help triage, not a verdict -- your "
+        "decision is what actually counts."
+        if threshold is not None
+        else "No validated classification threshold found yet (run `keywords scoring-bakeoff`)."
+    )
+    st.metric(
+        "BM25 match score",
+        f"{float(bm25_score):.1f}  ({bm25_classification or 'unscored'})",
+        help=threshold_text,
+    )
 
 mesh_raw = record.get("mesh_headings")
 if isinstance(mesh_raw, str) and mesh_raw.strip() not in ("", "[]"):
@@ -140,15 +208,16 @@ if isinstance(mesh_raw, str) and mesh_raw.strip() not in ("", "[]"):
     except json.JSONDecodeError:
         mesh_list = []
     if mesh_list:
-        st.caption(f"**MeSH:** {', '.join(mesh_list)}")
+        st.markdown(f"**MeSH terms:** {', '.join(mesh_list)}")
 
 with st.container(height=300):
     st.markdown(record.get("abstract") or "*(no abstract available)*", unsafe_allow_html=True)
 
-decision = st.radio(
-    "Decision", ["positive", "negative", "undeterminable", "skipped"], horizontal=True
-)
-
+# ---------------------------------------------------------------------------------------------
+# Decision -- P/N/U/S all submit immediately and advance (see module docstring for why there's no
+# separate staged-decision step). Notes/optional feature widgets are read at submit time via
+# their session_state keys, not through an st.form.
+# ---------------------------------------------------------------------------------------------
 _features_path = resolve_path("configs/curation_features.yaml")
 _features_config = (
     yaml.safe_load(_features_path.read_text()).get("features", [])
@@ -156,31 +225,82 @@ _features_config = (
     else []
 )
 
-_tag_options = ["", "uncertain", "close_negative"]
-if needs_screening:
-    # Reuses the existing tag/features mechanism rather than a new event-log column -- see
-    # bulk_scores.py's module docstring and Step 14b's docs for why.
-    _tag_options += ["screening_confirmed_negative", "screening_reclassified"]
+st.text_area("Notes (optional)", key="curate_notes")
+for feature in _features_config:
+    if feature["type"] == "bool":
+        st.checkbox(feature["label"], key=f"curate_feat_{feature['key']}")
+    elif feature["type"] == "select":
+        st.selectbox(feature["label"], [""] + feature["options"], key=f"curate_feat_{feature['key']}")
 
-with st.form("curation_form", clear_on_submit=True):
-    tag = st.selectbox("Tag (optional)", _tag_options)
-    notes = st.text_area("Notes")
 
-    feature_values: dict = {}
-    for feature in _features_config:
-        shown_when = feature.get("shown_when_decision")
-        if shown_when and shown_when != decision:
-            continue
-        if feature["type"] == "bool":
-            feature_values[feature["key"]] = st.checkbox(feature["label"])
-        elif feature["type"] == "select":
-            feature_values[feature["key"]] = st.selectbox(
-                feature["label"], [""] + feature["options"]
-            )
+def _submit(decision: str):
+    def _callback():
+        features = {}
+        for feature in _features_config:
+            value = st.session_state.get(f"curate_feat_{feature['key']}")
+            if value not in (None, "", False):
+                features[feature["key"]] = value
+            st.session_state[f"curate_feat_{feature['key']}"] = "" if feature["type"] == "select" else False
+        notes = st.session_state.get("curate_notes", "")
+        session.record_decision(decision, notes=notes, features=features or None)
+        st.session_state["curate_notes"] = ""
 
-    submitted = st.form_submit_button("Submit")
+    return _callback
 
-if submitted:
-    features = {k: v for k, v in feature_values.items() if v not in (None, "", False)}
-    session.record_decision(decision, tag=tag or None, notes=notes, features=features or None)
-    st.rerun()
+
+btn_col1, btn_col2, btn_col3, btn_col4 = st.columns(4)
+btn_col1.button(
+    "Positive (P)", on_click=_submit("positive"), use_container_width=True, type="primary"
+)
+btn_col2.button("Negative (N)", on_click=_submit("negative"), use_container_width=True)
+btn_col3.button("Undeterminable (U)", on_click=_submit("undeterminable"), use_container_width=True)
+btn_col4.button("Skip (S)", on_click=_submit("skipped"), use_container_width=True)
+
+# ---------------------------------------------------------------------------------------------
+# Keyboard shortcuts: P/N/U/S trigger the matching button above by simulating a real click on its
+# underlying DOM element (this is the only way to drive a server-side on_click callback from
+# client-side JS -- there's no direct Python hook to bind to). Guarded on a flag stashed on
+# `window.parent` (the actual browser tab, not this component's own iframe) so the listener is
+# attached exactly once for the page's lifetime -- st.iframe re-runs this script on every
+# Streamlit rerun (i.e. after every decision), and without the guard each rerun would stack
+# another duplicate listener on the parent document, eventually firing one keypress N times.
+# Ignored entirely while focus is inside a text input/textarea (typing "n" in Notes must type a
+# letter, not submit "negative").
+# ---------------------------------------------------------------------------------------------
+st.iframe(
+    """
+    <script>
+    (function() {
+        const doc = window.parent.document;
+        if (window.parent._domeTriageShortcutsAttached) { return; }
+        window.parent._domeTriageShortcutsAttached = true;
+
+        function findButton(labelStart) {
+            const buttons = Array.from(doc.querySelectorAll('button'));
+            return buttons.find(b => b.innerText.trim().startsWith(labelStart));
+        }
+
+        doc.addEventListener('keydown', function(e) {
+            const active = doc.activeElement;
+            const isTyping = active && (
+                active.tagName === 'TEXTAREA' ||
+                active.tagName === 'INPUT' ||
+                active.isContentEditable
+            );
+            if (isTyping) { return; }
+
+            const keyMap = {
+                'p': 'Positive (P)', 'n': 'Negative (N)',
+                'u': 'Undeterminable (U)', 's': 'Skip (S)',
+            };
+            const label = keyMap[e.key.toLowerCase()];
+            if (!label) { return; }
+            const btn = findButton(label);
+            if (btn) { btn.click(); e.preventDefault(); }
+        });
+    })();
+    </script>
+    """,
+    height=1,  # st.iframe rejects 0 (StreamlitInvalidHeightError) -- 1px is the smallest valid,
+    # effectively-invisible value; unlike the old components.html, 0 isn't accepted here.
+)

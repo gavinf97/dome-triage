@@ -5,19 +5,6 @@
 # covers free text.
 
 features:
-  - key: applies_ml_to_data
-    label: "Applies an ML/AI method to empirical data (vs. purely theoretical)?"
-    type: bool
-
-  - key: novel_algorithm
-    label: "Proposes a new algorithm/architecture (vs. applies an existing one)?"
-    type: bool
-
-  - key: domain_area
-    label: "Primary domain area"
-    type: select
-    options: [genomics, imaging, clinical, environmental, chemistry, other]
-
   - key: close_negative_reason
     label: "If negative: why? (only shown when decision = negative)"
     type: select
@@ -28,8 +15,3 @@ features:
       - review-mentions-ml-only
       - other
     shown_when_decision: negative
-
-  - key: curator_confidence
-    label: "Your confidence in this decision"
-    type: select
-    options: [low, medium, high]

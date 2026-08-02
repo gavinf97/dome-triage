@@ -340,27 +340,34 @@ def test_year_range_filter_restricts_queue(tmp_path):
     assert set(session.queue) == {"rec2", "rec3"}  # 2022 and 2020; 2018/2015 excluded
 
 
-def test_journal_filter_uses_top_n_bucketing(tmp_path):
-    # top_n_journals=1 -- only "Nature" (2 occurrences) keeps its own name, Science/Obscure
-    # (1 each) both collapse to "other". Chosen specifically to avoid a tie at the cutoff rank.
+def test_journal_filter_matches_exact_journal_names(tmp_path):
+    # journals filters directly against the real `journal` column (not a top-N-or-"other"
+    # bucket) -- a curator searching for a specific journal by name needs an exact match, and
+    # must be able to select ANY journal, not just one from a pre-baked top-N shortlist.
     dataset_path = _write_dataset_for_filters(tmp_path / "canonical_dataset.csv")
     session = CurationSession(
         dataset_path=dataset_path,
         events_path=tmp_path / "events.csv",
         curator="alice",
         journals=["Nature"],
-        top_n_journals=1,
     )
     assert set(session.queue) == {"rec1", "rec2"}
 
-    other_session = CurationSession(
+    obscure_session = CurationSession(
         dataset_path=dataset_path,
         events_path=tmp_path / "events.csv",
         curator="alice",
-        journals=["other"],
-        top_n_journals=1,
+        journals=["Obscure Journal"],
     )
-    assert set(other_session.queue) == {"rec3", "rec4"}
+    assert set(obscure_session.queue) == {"rec4"}
+
+    multi_session = CurationSession(
+        dataset_path=dataset_path,
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+        journals=["Science", "Obscure Journal"],
+    )
+    assert set(multi_session.queue) == {"rec3", "rec4"}
 
 
 def test_score_band_filter_splits_high_and_low(tmp_path):
@@ -420,3 +427,103 @@ def test_diversity_stats_reflects_live_session_decisions_before_materialize(tmp_
     after = session.diversity_stats()
     assert after["per_journal_counts"].loc["J3", "negative"] == 1
     assert after["n_journals_covered"] == before["n_journals_covered"] + 1
+
+
+def test_score_band_summary_reports_real_ranges_and_curated_counts(tmp_path):
+    dataset_path = _write_dataset_for_filters(tmp_path / "canonical_dataset.csv")
+    session = CurationSession(
+        dataset_path=dataset_path,
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+        bulk_score_lookup=_FILTER_SCORE_LOOKUP,  # PMC1:10, PMC2:200, PMC3:150, PMC4:5
+        n_score_bands=2,
+    )
+
+    summary = session.score_band_summary()
+
+    assert [s["band"] for s in summary] == [0, 1]
+    low, high = summary
+    assert low["min_score"] == 5.0 and low["max_score"] == 10.0
+    assert high["min_score"] == 150.0 and high["max_score"] == 200.0
+    assert low["total"] == 2 and high["total"] == 2
+    # nothing decided yet -- all zero
+    assert low["confirmed"] == 0 and high["confirmed"] == 0
+
+
+def test_score_band_summary_reflects_confirmed_decisions(tmp_path):
+    dataset_path = _write_dataset_for_filters(tmp_path / "canonical_dataset.csv")
+    session = CurationSession(
+        dataset_path=dataset_path,
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+        bulk_score_lookup=_FILTER_SCORE_LOOKUP,
+        n_score_bands=2,
+    )
+    session.record_decision("negative")  # decides rec1 (PMC1, score 10 -> low band)
+
+    summary = session.score_band_summary()
+    low = next(s for s in summary if s["band"] == 0)
+    assert low["confirmed"] == 1
+
+
+def test_go_back_and_go_forward_navigate_without_changing_remaining(tmp_path):
+    dataset_path = _write_dataset(tmp_path / "canonical_dataset.csv")
+    session = CurationSession(
+        dataset_path=dataset_path, events_path=tmp_path / "events.csv", curator="alice"
+    )
+
+    assert not session.can_go_back()
+    session.record_decision("positive")  # decides rec1, now on rec2
+    assert session.current_record()["record_id"] == "rec2"
+    assert session.stats() == {"total": 3, "decided": 1, "remaining": 2}
+
+    assert session.can_go_back()
+    session.go_back()
+    assert session.current_record()["record_id"] == "rec1"
+    # remaining/decided must NOT change just from looking backward
+    assert session.stats() == {"total": 3, "decided": 1, "remaining": 2}
+
+    assert session.can_go_forward()
+    session.go_forward()
+    assert session.current_record()["record_id"] == "rec2"
+    assert not session.can_go_forward()  # back at the frontier, nothing further to re-approach
+
+
+def test_go_forward_is_capped_at_frontier_not_full_queue(tmp_path):
+    dataset_path = _write_dataset(tmp_path / "canonical_dataset.csv")
+    session = CurationSession(
+        dataset_path=dataset_path, events_path=tmp_path / "events.csv", curator="alice"
+    )
+    session.go_forward()  # nothing decided yet -- must be a no-op, not skip ahead undecided
+    assert session.current_record()["record_id"] == "rec1"
+
+
+def test_revisiting_and_redeciding_a_record_advances_past_the_original_frontier(tmp_path):
+    dataset_path = _write_dataset(tmp_path / "canonical_dataset.csv")
+    session = CurationSession(
+        dataset_path=dataset_path, events_path=tmp_path / "events.csv", curator="alice"
+    )
+    session.record_decision("positive")  # rec1 -> positive, now on rec2
+    session.go_back()  # back to rec1
+    session.record_decision("negative")  # change mind on rec1 -> negative, advances to rec2 again
+
+    assert session.current_record()["record_id"] == "rec2"
+    events = pd.read_csv(tmp_path / "events.csv")
+    rec1_events = events[events["record_id"] == "rec1"]
+    assert list(rec1_events["decision"]) == ["positive", "negative"]  # both kept, append-only
+
+
+def test_current_record_prior_decision_reflects_latest_this_session(tmp_path):
+    dataset_path = _write_dataset(tmp_path / "canonical_dataset.csv")
+    session = CurationSession(
+        dataset_path=dataset_path, events_path=tmp_path / "events.csv", curator="alice"
+    )
+    assert session.current_record_prior_decision() is None  # never decided yet
+
+    session.record_decision("positive")
+    session.go_back()
+    assert session.current_record_prior_decision() == "positive"
+
+    session.record_decision("negative")  # overwrite while revisiting
+    session.go_back()
+    assert session.current_record_prior_decision() == "negative"

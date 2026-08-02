@@ -29,7 +29,15 @@ def build_strata(
     top_journals = df["journal"].value_counts().head(top_n_journals).index
     df["journal_bucket"] = df["journal"].where(df["journal"].isin(top_journals), "other")
 
-    df["year_bucket"] = (df["year"].astype("Int64") // year_bucket_width * year_bucket_width)
+    # pd.to_numeric first, not a direct .astype("Int64") -- real data has string-formatted-float
+    # years ("2012.0", a pre-existing artifact from the dedupe/consolidate pipeline's own CSV
+    # round-tripping, confirmed present in canonical_dataset.csv), which .astype("Int64") rejects
+    # outright (ArrowInvalid: "Failed to parse string: '2012.0' as a scalar of type int64") --
+    # a real crash hit live against real data, not a hypothetical. to_numeric parses both "2012"
+    # and "2012.0" fine; the subsequent .astype("Int64") only ever sees clean float/NaN input.
+    df["year_bucket"] = (
+        pd.to_numeric(df["year"], errors="coerce").astype("Int64") // year_bucket_width * year_bucket_width
+    )
 
     return df
 

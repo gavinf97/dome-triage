@@ -77,6 +77,31 @@ and the KeyBERT/sentence-transformers model weights are only present inside the 
 (baked in at build time), so a host-Python run will silently diverge from what the pipeline
 actually does in the container. If a `.venv`/`venv` directory ever appears here, delete it.
 
+## Docker disk hygiene
+
+**Every `docker compose build` re-run leaves the previous image dangling** (untagged, shows as
+`<none>:<none>` in `docker images`/`docker system df -v`) -- the new build takes the `latest` tag,
+the old one doesn't get deleted, it just loses its name. At ~6.3GB per `dome-triage-pipeline`/
+`dome-triage-curate` image, this accumulates fast across an iterative session: a real incident hit
+**14 dangling images (~88GB) and 98% host disk usage** from one session's worth of edit-rebuild
+cycles before it was caught. The host also runs other, unrelated Docker Compose projects --
+`docker system df -v`'s image list is shared across all of them, not scoped to this repo.
+
+Prune periodically during any session with several rebuilds, and always if disk space gets tight:
+
+```bash
+docker container prune -f   # removes stopped containers first (they can pin an image, blocking its removal)
+docker image prune -f       # removes dangling (untagged, superseded) images -- safe, never touches a tagged image
+```
+
+Both are non-destructive to anything still in use: `image prune` (no `-a` flag) only ever removes
+images with no tag and no container referencing them -- a tagged image any project's compose file
+points to, running or not, is never touched. Do not reach for `docker image prune -af` (removes
+*all* unused images, including other projects' tagged-but-currently-stopped ones) or
+`docker system prune -a` without asking first -- the two commands above are the safe default and
+are usually enough on their own; note in `docker system df` output that build cache
+(`docker builder prune -f`, see below) is a separate, often much larger pool worth checking too.
+
 ## Testing
 
 `docker compose run --rm pipeline pytest` from the repo root — not bare `pytest` on the host (see

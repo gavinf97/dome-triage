@@ -68,3 +68,20 @@ def test_stratified_sample_works_with_journal_year_only_strata():
     counts = sampled.groupby(strata_cols).size()
     assert (counts <= 2).all()
     assert (report["sampled"] <= report["available"]).all()
+
+
+def test_build_strata_handles_string_formatted_float_years():
+    # Real crash hit live against canonical_dataset.csv: some `year` values are stored as
+    # "2012.0" (a pre-existing artifact from the dedupe/consolidate pipeline's CSV round-tripping,
+    # not synthetic) -- a direct df["year"].astype("Int64") rejects that string outright
+    # (ArrowInvalid). Must parse cleanly via pd.to_numeric first.
+    df = pd.DataFrame(
+        {
+            "match_score": [0.1, 0.2, 0.3],
+            "journal": ["Nature", "Science", "Nature"],
+            "year": ["2012.0", "2015", None],
+        }
+    )
+    strata_df = build_strata(df, score_col="match_score", n_score_bands=1, top_n_journals=2, year_bucket_width=5)
+
+    assert strata_df["year_bucket"].tolist() == [2010, 2015, pd.NA]

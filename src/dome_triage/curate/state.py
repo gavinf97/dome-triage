@@ -57,8 +57,10 @@ class CurationSession:
 
     # Filters -- each None/False means "no restriction", matching include_already_labeled/
     # require_pmcid's existing on/off-toggle pattern. score_band values are the integer band
-    # labels build_strata() produces (0 = lowest quartile ... n_score_bands-1 = highest);
-    # journals values are journal_bucket entries (an exact top-N journal name, or "other").
+    # labels build_strata() produces (0 = lowest quartile ... n_score_bands-1 = highest).
+    # `journals` is a list of exact journal names (matched directly against the `journal` column,
+    # not the top-N-or-"other" journal_bucket concept -- a curator searching for a specific
+    # journal by name needs an exact match against the *real* value, not a bucketed one).
     score_band: Optional[list] = None
     journals: Optional[list] = None
     year_range: Optional[tuple] = None
@@ -72,6 +74,11 @@ class CurationSession:
     queue: list = field(init=False, repr=False)
     _reviewable_ids: set = field(init=False, repr=False)
     _position: int = field(init=False, default=0)
+    # Furthest point the queue has ever reached -- distinct from `_position`, which can move
+    # backward/forward freely once you're revisiting records you've already decided this session
+    # (see go_back()/go_forward()). `stats()`/`remaining()` are driven by `_frontier`, not
+    # `_position`, so browsing back through past decisions doesn't make "remaining" fluctuate.
+    _frontier: int = field(init=False, default=0)
 
     def __post_init__(self) -> None:
         self.dataset = pd.read_csv(self.dataset_path, dtype=str)
@@ -82,6 +89,34 @@ class CurationSession:
         )
         decided = set(self.events["record_id"]) if not self.events.empty else set()
 
+        scored = self._scored_pool()
+        reviewable = scored
+
+        if self.score_band is not None:
+            band_col = "match_score_band__bulk_match_score"
+            reviewable = reviewable[
+                reviewable[band_col].isin(self.score_band) if band_col in reviewable.columns else False
+            ]
+        if self.journals is not None:
+            reviewable = reviewable[reviewable["journal"].isin(self.journals)]
+        if self.year_range is not None:
+            year_numeric = pd.to_numeric(reviewable["year"], errors="coerce")
+            lo, hi = self.year_range
+            reviewable = reviewable[(year_numeric >= lo) & (year_numeric <= hi)]
+
+        self._reviewable_ids = set(reviewable["record_id"])
+        self.queue = [
+            rid for rid in self.dataset["record_id"] if rid in self._reviewable_ids and rid not in decided
+        ]
+        self._position = 0
+        self._frontier = 0
+
+    def _scored_pool(self) -> pd.DataFrame:
+        """Applies every filter *except* score_band/journals/year_range, and adds the score-band
+        column (via build_strata, unconditionally -- not just when score_band filtering is
+        active) -- shared by __post_init__ (which goes on to apply the remaining three filters)
+        and score_band_summary() (which needs this same base population to report accurate
+        per-band totals regardless of which band, if any, is currently selected)."""
         reviewable = self.dataset
         if not self.include_already_labeled:
             trusted_mask = self.dataset["label_confidence"].isin(_TRUSTED_LABEL_CONFIDENCE) & self.dataset[
@@ -103,32 +138,44 @@ class CurationSession:
         if self.needs_screening_only:
             reviewable = reviewable[reviewable.get("needs_screening", pd.Series(dtype=bool)).fillna(False)]
 
-        if self.journals is not None or self.score_band is not None:
-            has_scores = "bulk_match_score" in reviewable.columns and reviewable["bulk_match_score"].notna().any()
-            bucketed = build_strata(
-                reviewable.assign(year=pd.to_numeric(reviewable["year"], errors="coerce")),
-                score_col="bulk_match_score" if has_scores else None,
-                n_score_bands=self.n_score_bands,
-                top_n_journals=self.top_n_journals,
+        has_scores = "bulk_match_score" in reviewable.columns and reviewable["bulk_match_score"].notna().any()
+        return build_strata(
+            reviewable,
+            score_col="bulk_match_score" if has_scores else None,
+            n_score_bands=self.n_score_bands,
+            top_n_journals=self.top_n_journals,
+        )
+
+    def score_band_summary(self) -> list[dict]:
+        """One entry per score band (lowest to highest), for the filter widget's labels: the
+        real numeric score range within that band, and how many of its records are already
+        confirmed (trusted, or decided this session) out of how many total -- so "Q1"/"Q4" stop
+        being opaque and show real numbers instead. Computed fresh from `_scored_pool()` (the
+        pre-score-band/journal/year-filtered population), so it doesn't shift confusingly just
+        because a *different* band is currently selected."""
+        pool = self._scored_pool()
+        band_col = "match_score_band__bulk_match_score"
+        if band_col not in pool.columns or pool.empty:
+            return []
+
+        reviewed_ids = set(self.events["record_id"]) if not self.events.empty else set()
+        confirmed_mask = pool["label_confidence"].isin(_TRUSTED_LABEL_CONFIDENCE) | pool["record_id"].isin(
+            reviewed_ids
+        )
+
+        summary = []
+        for band in sorted(pool[band_col].dropna().unique()):
+            band_df = pool[pool[band_col] == band]
+            summary.append(
+                {
+                    "band": int(band),
+                    "min_score": float(band_df["bulk_match_score"].min()),
+                    "max_score": float(band_df["bulk_match_score"].max()),
+                    "total": int(len(band_df)),
+                    "confirmed": int(confirmed_mask[band_df.index].sum()),
+                }
             )
-            combined_mask = pd.Series(True, index=reviewable.index)
-            if self.journals is not None:
-                combined_mask &= bucketed["journal_bucket"].isin(self.journals)
-            band_col = "match_score_band__bulk_match_score"
-            if self.score_band is not None:
-                combined_mask &= bucketed[band_col].isin(self.score_band) if band_col in bucketed.columns else False
-            reviewable = reviewable[combined_mask]
-
-        if self.year_range is not None:
-            year_numeric = pd.to_numeric(reviewable["year"], errors="coerce")
-            lo, hi = self.year_range
-            reviewable = reviewable[(year_numeric >= lo) & (year_numeric <= hi)]
-
-        self._reviewable_ids = set(reviewable["record_id"])
-        self.queue = [
-            rid for rid in self.dataset["record_id"] if rid in self._reviewable_ids and rid not in decided
-        ]
-        self._position = 0
+        return summary
 
     def diversity_stats(self) -> dict:
         """All-time/corpus-wide diversity of *confirmed* (trusted-source OR actually decided in
@@ -171,7 +218,7 @@ class CurationSession:
         return len(self._reviewable_ids)
 
     def remaining(self) -> int:
-        return len(self.queue) - self._position
+        return len(self.queue) - self._frontier
 
     def stats(self) -> dict:
         total = self.total()
@@ -185,6 +232,36 @@ class CurationSession:
         matches = self.dataset.loc[self.dataset["record_id"] == record_id]
         return matches.iloc[0] if not matches.empty else None
 
+    def current_record_prior_decision(self) -> Optional[str]:
+        """The latest decision already recorded this session for the record currently on screen,
+        if any -- lets the UI show "you already marked this X" when backtracking, rather than
+        presenting a blank slate as if it were never reviewed."""
+        record = self.current_record()
+        if record is None or self.events.empty:
+            return None
+        matches = self.events[self.events["record_id"] == record["record_id"]]
+        if matches.empty:
+            return None
+        return matches.sort_values("timestamp").iloc[-1]["decision"]
+
+    def can_go_back(self) -> bool:
+        return self._position > 0
+
+    def can_go_forward(self) -> bool:
+        return self._position < self._frontier
+
+    def go_back(self) -> None:
+        """Moves the viewing cursor back one record -- to revisit and, if you want, change a
+        decision you already made this session. Never touches the event log by itself; only
+        `record_decision()` writes anything."""
+        self._position = max(0, self._position - 1)
+
+    def go_forward(self) -> None:
+        """Re-approaches a record you've already passed (up to `_frontier`, the furthest point
+        reached) without deciding it again -- capped there so "forward" can't skip past
+        undecided territory; only an actual decision extends the frontier."""
+        self._position = min(self._frontier, self._position + 1)
+
     def record_decision(
         self,
         decision: str,
@@ -192,8 +269,12 @@ class CurationSession:
         notes: str = "",
         features: Optional[dict] = None,
     ) -> None:
-        """Appends one row to the event log (backup-before-write) and advances the queue.
-        `decision` should be one of "positive"/"negative"/"undeterminable"/"skipped". `features`
+        """Appends one row to the event log (backup-before-write, so nothing is lost even if the
+        container closes mid-session) and advances the queue. `decision` should be one of
+        "positive"/"negative"/"undeterminable"/"skipped". Works the same whether the current
+        record is brand new or one you've backtracked to revisit -- a repeat decision for the same
+        record_id is just another append; `materialize_events()`'s "last event wins" logic (and
+        `diversity_stats()`'s live overlay) already handle picking the latest one. `features`
         holds the structured curation-feature flags (configs/curation_features.yaml) as a dict,
         stored as JSON -- a living, extensible checklist, not a fixed schema."""
         record = self.current_record()
@@ -217,6 +298,7 @@ class CurationSession:
 
         self.events = pd.concat([self.events, pd.DataFrame([row])], ignore_index=True)
         self._position += 1
+        self._frontier = max(self._frontier, self._position)
 
 
 def materialize_events(dataset_path: Path, events_path: Path, output_path: Path) -> pd.DataFrame:

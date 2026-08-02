@@ -126,3 +126,23 @@ def annotate_screening(dataset: pd.DataFrame, lookup: dict[str, bool], out_col: 
         flag = mapped if flag is None else flag.fillna(mapped)
     dataset[out_col] = (flag.fillna(False) if flag is not None else pd.Series(False, index=dataset.index)).astype(bool)
     return dataset
+
+
+def load_youden_threshold(
+    bakeoff_report_path: Path, scorer_name: str = "bm25", condition: str = "positive_plus_exclusionary_lexicon"
+) -> float | None:
+    """Reads the Youden-optimal threshold Step 11's bake-off validated for `scorer_name`/
+    `condition` from `scoring_bakeoff_report.csv` -- for the Curate app's BM25-score tooltip, so
+    the "what does this number mean" explanation cites the *real* validated cutoff, not a
+    hardcoded guess. Mirrors `pipeline/steps.py::_lookup_youden_threshold` exactly, duplicated
+    (not imported) for the same reason as this module's other functions: importing from
+    `pipeline.steps` would pull `torch` into the Streamlit process. Returns None gracefully if the
+    report doesn't exist yet or has no matching row."""
+    bakeoff_report_path = Path(bakeoff_report_path)
+    if not bakeoff_report_path.exists():
+        return None
+    report = pd.read_csv(bakeoff_report_path)
+    match = report[(report["scorer"] == scorer_name) & (report["condition"] == condition)]
+    if match.empty or pd.isna(match.iloc[0]["threshold_youden"]):
+        return None
+    return float(match.iloc[0]["threshold_youden"])
