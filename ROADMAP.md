@@ -10,6 +10,11 @@ built — but not implemented yet.
 Which steps are fully automated, which produce a *candidate* file that isn't trusted until a
 human looks at it, and exactly what gets reviewed where:
 
+**Sequencing note (2026-08-02):** rows #7/#7b (clear negatives) are built and tested but
+deliberately **on hold** — the plan is to complete a real manual curation pass on row #6's queue
+first (validating the pipeline via a large bulk of genuine human review), then come back to
+expanding the negative pool. See `STEPS_Progress.md` Step 14/14b for the live status.
+
 | # | Command | Automated output | Human reviews via | Reviewed/approved output |
 |---|---|---|---|---|
 | 1 | `ingest load-sources` → `dedupe consolidate` | `canonical_dataset.csv` | Conflicts page (only flagged conflicts need a fresh look — the rest were already human-labeled in prior curation rounds) | `conflict_resolutions.csv` |

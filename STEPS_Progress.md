@@ -41,7 +41,7 @@ section rather than repeating it.
 | Phase | State |
 |---|---|
 | Phase 0 — repo scaffold | ✅ Done |
-| Phase 1 — data consolidation → curation | 🟡 Steps 1–13 done (incl. the keyword lexicon, the full BM25 bulk-match/score/stratify pipeline, and the Curate app's new filters + diversity dashboard). Step 14/14b (clear negatives + screening) built and tested but not yet fired live — deliberately left for you to trigger when ready (see Step 14). Step 15 (human curation) is open and ready to start. |
+| Phase 1 — data consolidation → curation | 🟡 Steps 1–13 done (incl. the keyword lexicon, the full BM25 bulk-match/score/stratify pipeline, and the Curate app's new filters + diversity dashboard). **Step 14/14b (clear negatives + screening) ON HOLD by explicit decision (2026-08-02)** — built and tested, but deliberately not run yet; come back to it *after* a real manual curation pass, not before (see the hold notes on Step 14/14b). Step 15 (human curation) is open now — **this is the active next step**. |
 | Phases 2–8 (EDAM tagging, classifiers, calibration, bulk scan, daily pipeline) | ⬜ Not implemented — no code exists yet beyond stub `__init__.py` files. Nothing to run here; see the closing section. |
 
 Canonical dataset right now: **6,647 records** (`data/processed/canonical_dataset.csv`) — the
@@ -792,6 +792,13 @@ ballpark for your `cap_per_stratum`. Check `stratum_report.csv` for any wildly u
 
 ## Step 14 — Fetch clear negatives
 
+> **⏸ ON HOLD — deliberate, not forgotten.** Your explicit call (2026-08-02): don't run this yet.
+> Sequencing decision: finish a real manual curation pass on the queue Step 13 already built
+> (Step 15 — 2,862 papers, open now) first, so a large bulk of genuine human review happens and
+> validates the pipeline before the negative pool gets expanded further. Come back to Step 14
+> **after** that curation pass, not before. The code is built and tested either way (136/136
+> passing) — this is purely a "not yet" on timing, nothing here is blocked or broken.
+
 **What's happening / why:** The bulk-match query (Step 9) structurally can't produce a true "no
 AI/ML mention at all" negative — it only ever matches AI/ML papers. This step queries **live
 Europe PMC directly** (not the local 750k pool) for the *inverse*: `EXCLUDE_QUERY` in
@@ -850,6 +857,9 @@ isn't wildly more skewed than you intended.
 ---
 
 ## Step 14b — Screen clear negatives against the lexicon ("strong negative" check)
+
+> **⏸ ON HOLD along with Step 14** — same reason, same "after Step 15" sequencing. Nothing to run
+> here until Step 14 itself has actually been fired.
 
 **What's happening / why:** A "clear negative" was fetched specifically for **not** containing the
 literal phrase "artificial intelligence"/"machine learning" — but a paper can discuss ML concepts

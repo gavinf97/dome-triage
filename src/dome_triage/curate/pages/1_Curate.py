@@ -128,7 +128,9 @@ if needs_screening:
         "AI/ML exclusion query used to fetch it -- double-check before confirming negative."
     )
 
-st.subheader(record.get("title") or "(no title)")
+st.markdown(
+    f"### {record.get('title') or '(no title)'}", unsafe_allow_html=True
+)
 st.caption(f"{record.get('journal') or ''}  ·  {record.get('year') or ''}")
 
 mesh_raw = record.get("mesh_headings")
