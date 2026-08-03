@@ -300,13 +300,14 @@ def _display_year(value) -> str:
         return "(unknown)"
 
 
-meta_col1, meta_col2 = st.columns(2)
-meta_col1.markdown(f"**Journal:** {record.get('journal') or '(unknown)'}", unsafe_allow_html=True)
-meta_col2.markdown(f"**Year:** {_display_year(record.get('year'))}")
-
 bm25_score = record.get("bulk_match_score")
 bm25_classification = record.get("bulk_match_classification")
-if bm25_score not in (None, "", "nan") and str(bm25_score) != "nan":
+has_bm25 = bm25_score not in (None, "", "nan") and str(bm25_score) != "nan"
+
+meta_col1, meta_col2, meta_col3 = st.columns(3)
+meta_col1.markdown(f"**Journal:** {record.get('journal') or '(unknown)'}", unsafe_allow_html=True)
+meta_col2.markdown(f"**Year:** {_display_year(record.get('year'))}")
+if has_bm25:
     threshold = get_youden_threshold()
     threshold_text = (
         f"Classified **{bm25_classification or '(unscored)'}** because the score is "
@@ -317,7 +318,7 @@ if bm25_score not in (None, "", "nan") and str(bm25_score) != "nan":
         if threshold is not None
         else "No validated classification threshold found yet (run `keywords scoring-bakeoff`)."
     )
-    st.metric(
+    meta_col3.metric(
         "BM25 match score",
         f"{float(bm25_score):.1f}  ({bm25_classification or 'unscored'})",
         help=threshold_text,
@@ -435,26 +436,71 @@ st.text_area("Notes (optional)", key="curate_notes")
 # feature-option button (see above -- selecting one this way does NOT submit anything, exactly
 # like clicking it), all by simulating a real click on the underlying DOM element (this is the
 # only way to drive a server-side on_click callback from client-side JS -- there's no direct
-# Python hook to bind to). Guarded on a flag stashed on `window.parent` (the actual browser tab,
-# not this component's own iframe) so the listener is attached exactly once for the page's
-# lifetime -- st.iframe re-runs this script on every Streamlit rerun (i.e. after every decision or
-# feature toggle), and without the guard each rerun would stack another duplicate listener on the
-# parent document, eventually firing one keypress N times. Ignored entirely while focus is inside
-# a text input/textarea (typing "n" or "1" in Notes must type a character, not trigger a
-# shortcut). `_digit_shortcuts` is built in Python above from whatever `configs/curation_features.
-# yaml` currently declares -- extending it with a 6th (or 10th) option needs no JS change here.
+# Python hook to bind to). Two real, live bugs fixed here (both found by driving this page with an
+# actual browser, not just Streamlit's AppTest, which never executes real JS/DOM at all):
+#
+#   1. "Shortcuts worked once, then stopped after touching a filter" -- adjusting a number_input
+#      or the journal multiselect's search box leaves the browser's keyboard focus sitting inside
+#      that <input> even after you're done with it. The isTyping guard below then correctly (by
+#      design -- typing "n" in Notes must type "n") swallows every subsequent shortcut key, but
+#      silently -- there was no way to tell "I'm in an input" from "this is just broken". Fixed by
+#      blurring any stray-focused <input> (never TEXTAREA -- Notes must stay interruptible-free)
+#      at the top of *every* rerun, not just once: st.iframe re-runs this whole script on every
+#      Streamlit rerun (confirmed live), so this check runs fresh every time without needing its
+#      own guard.
+#   2. No visual confirmation a keypress was even received -- Streamlit's own rerun can take
+#      seconds (the full bulk pool, especially), during which nothing on screen changes. Fixed
+#      with `showFeedback()`, a small toast appended directly to `doc.body` (a sibling of
+#      Streamlit's own React root, so Streamlit's re-renders never touch or clear it) that flashes
+#      the matched action immediately -- independent of, and faster than, Streamlit's round trip.
+#
+# The keydown *listener* itself is still attached exactly once per page lifetime, guarded on a
+# flag stashed on `window.parent` (the actual browser tab, not this component's own iframe) --
+# without that guard, each rerun would stack another duplicate listener on the parent document,
+# eventually firing one keypress N times. `_digit_shortcuts` is built in Python above from
+# whatever `configs/curation_features.yaml` currently declares -- extending it with a 6th (or
+# 10th) option needs no JS change here.
 # ---------------------------------------------------------------------------------------------
 st.iframe(
     """
     <script>
     (function() {
         const doc = window.parent.document;
+
+        const stuckFocus = doc.activeElement;
+        if (stuckFocus && stuckFocus.tagName === 'INPUT') { stuckFocus.blur(); }
+
         if (window.parent._domeTriageShortcutsAttached) { return; }
         window.parent._domeTriageShortcutsAttached = true;
 
         function findButton(labelStart) {
             const buttons = Array.from(doc.querySelectorAll('button'));
-            return buttons.find(b => b.innerText.trim().startsWith(labelStart));
+            const matches = buttons.filter(b => b.innerText.trim().startsWith(labelStart));
+            // A button with a `help=` tooltip (the numbered reason buttons) renders as TWO DOM
+            // nodes -- one real/visible, one a zero-size disconnected leftover -- prefer the
+            // visible one instead of trusting DOM order to put the real one first.
+            return matches.find(b => b.offsetParent !== null) || matches[0];
+        }
+
+        function showFeedback(text) {
+            let el = doc.getElementById('_domeTriageKeyToast');
+            if (!el) {
+                el = doc.createElement('div');
+                el.id = '_domeTriageKeyToast';
+                el.style.cssText = 'position:fixed; top:10px; left:50%; '
+                    + 'transform:translateX(-50%); background:#1a7f4b; color:#fff; '
+                    + 'padding:8px 18px; border-radius:6px; font-family:"Source Sans Pro",'
+                    + 'sans-serif; font-size:14px; font-weight:600; z-index:999999; '
+                    + 'box-shadow:0 2px 12px rgba(0,0,0,0.35); pointer-events:none; opacity:0; '
+                    + 'transition:opacity 0.12s ease-out;';
+                doc.body.appendChild(el);
+            }
+            el.textContent = '\\u2328 ' + text;
+            el.style.opacity = '1';
+            clearTimeout(window.parent._domeTriageToastTimer);
+            window.parent._domeTriageToastTimer = setTimeout(function() {
+                el.style.opacity = '0';
+            }, 900);
         }
 
         doc.addEventListener('keydown', function(e) {
@@ -475,7 +521,13 @@ st.iframe(
             const label = keyMap[e.key.toLowerCase()];
             if (!label) { return; }
             const btn = findButton(label);
-            if (btn) { btn.click(); e.preventDefault(); }
+            if (!btn) {
+                showFeedback('"' + e.key.toUpperCase() + '" -- button not found, try again');
+                return;
+            }
+            showFeedback(label);
+            btn.click();
+            e.preventDefault();
         });
     })();
     </script>
