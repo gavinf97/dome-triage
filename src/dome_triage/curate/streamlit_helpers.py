@@ -139,6 +139,7 @@ def _bulk_pool_session_kwargs(cfg: PipelineConfig) -> dict:
 
 def build_probe_session(
     include_already_labeled: bool = False,
+    only_already_labeled: bool = False,
     require_pmcid: bool = False,
     classification: list | None = None,
     needs_screening_only: bool = False,
@@ -168,6 +169,7 @@ def build_probe_session(
     key = (
         curator,
         include_already_labeled,
+        only_already_labeled,
         require_pmcid,
         tuple(sorted(classification)) if classification else None,
         needs_screening_only,
@@ -179,6 +181,7 @@ def build_probe_session(
             events_path=resolve_path(cfg.pipeline["curation"]["events_log"]),
             curator=curator,
             include_already_labeled=include_already_labeled,
+            only_already_labeled=only_already_labeled,
             require_pmcid=require_pmcid,
             classification=classification,
             needs_screening_only=needs_screening_only,
@@ -199,6 +202,7 @@ def build_probe_session(
 
 def get_session(
     include_already_labeled: bool = False,
+    only_already_labeled: bool = False,
     require_pmcid: bool = False,
     score_band: list | None = None,
     journals: list | None = None,
@@ -230,6 +234,7 @@ def get_session(
     key = (
         curator,
         include_already_labeled,
+        only_already_labeled,
         require_pmcid,
         tuple(sorted(score_band)) if score_band else None,
         tuple(sorted(journals)) if journals else None,
@@ -247,6 +252,7 @@ def get_session(
             events_path=resolve_path(cfg.pipeline["curation"]["events_log"]),
             curator=curator,
             include_already_labeled=include_already_labeled,
+            only_already_labeled=only_already_labeled,
             require_pmcid=require_pmcid,
             journals=journals,
             year_range=year_range,

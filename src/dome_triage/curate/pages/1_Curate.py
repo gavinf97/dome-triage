@@ -60,14 +60,18 @@ queue_source = "bulk_pool" if queue_source_label.startswith("Full AI/ML") else "
 # ---------------------------------------------------------------------------------------------
 with st.expander("Filters", expanded=False):
     toggle_col1, toggle_col2 = st.columns(2)
-    include_already_labeled = toggle_col1.checkbox(
-        "Also show already-curated records (from the ORIGINAL curation effort, for re-checking)",
-        value=False,
-        help="Off by default: records already trusted from a prior curation round -- "
-        "DOME_Top_Curate, the DOME registry, or a decision you already materialized through this "
-        "app -- are settled ground truth and excluded from the queue. Turn this on only if you "
-        "deliberately want to revisit and possibly change some of those original decisions.",
+    already_curated_mode = toggle_col1.radio(
+        "Already-curated records (from the ORIGINAL curation effort)",
+        options=["Hide (default)", "Include in queue", "Only show these (re-check)"],
+        index=0,
+        help="'Hide': settled ground truth -- DOME_Top_Curate, the DOME registry, or a decision "
+        "you already materialized through this app -- stays out of the queue (the default). "
+        "'Include in queue': mix already-curated records in alongside not-yet-curated ones. "
+        "'Only show these': filter the queue down to *just* the already-curated records, for "
+        "deliberately revisiting and possibly changing past decisions.",
     )
+    include_already_labeled = already_curated_mode != "Hide (default)"
+    only_already_labeled = already_curated_mode == "Only show these (re-check)"
     require_pmcid = toggle_col2.checkbox(
         "Only show records with full text available (has PMCID)", value=False
     )
@@ -92,6 +96,7 @@ with st.expander("Filters", expanded=False):
     # bounds. queue_source-aware -- see build_probe_session()'s docstring.
     probe = build_probe_session(
         include_already_labeled=include_already_labeled,
+        only_already_labeled=only_already_labeled,
         require_pmcid=require_pmcid,
         classification=classification or None,
         needs_screening_only=needs_screening_only,
@@ -200,6 +205,7 @@ with st.expander("Filters", expanded=False):
 
 session = get_session(
     include_already_labeled=include_already_labeled,
+    only_already_labeled=only_already_labeled,
     require_pmcid=require_pmcid,
     score_band=score_band or None,
     journals=journals or None,
@@ -350,9 +356,6 @@ _features_config = (
     else []
 )
 
-st.text_area("Notes (optional)", key="curate_notes")
-
-
 def _toggle_feature_option(state_key: str, option: str):
     def _callback():
         st.session_state[state_key] = "" if st.session_state.get(state_key) == option else option
@@ -418,6 +421,14 @@ btn_col1.button(
 btn_col2.button("Negative (N)", on_click=_submit("negative"), use_container_width=True)
 btn_col3.button("Undeterminable (U)", on_click=_submit("undeterminable"), use_container_width=True)
 btn_col4.button("Skip (S)", on_click=_submit("skipped"), use_container_width=True)
+
+# Last on the page, deliberately -- if Notes sits above the decision row, it's easy to leave your
+# cursor focused inside it after jotting something down, and the keyboard-shortcut script below
+# intentionally ignores every key while a text input/textarea has focus (so typing "n" in a note
+# types "n", it doesn't submit Negative). Notes' value is read from session_state at submit time
+# regardless of where it sits visually, so moving it here doesn't change when a note is captured --
+# it just keeps focus off a text field during normal keyboard-driven review.
+st.text_area("Notes (optional)", key="curate_notes")
 
 # ---------------------------------------------------------------------------------------------
 # Keyboard shortcuts: P/N/U/S trigger the matching decision button, 1-9 toggle the matching

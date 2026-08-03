@@ -48,6 +48,11 @@ class CurationSession:
     events_path: Path
     curator: str = "unknown"
     include_already_labeled: bool = False
+    # Mutually exclusive with the *exclusion* half of include_already_labeled -- when True, the
+    # queue is filtered DOWN to just the trusted records (for deliberately re-checking a past
+    # decision) instead of either hiding or merely allowing them alongside everything else. Takes
+    # precedence over include_already_labeled in _scored_pool() (see there).
+    only_already_labeled: bool = False
     require_pmcid: bool = False
 
     # Pre-built dataset override -- when given, __post_init__ uses this DataFrame directly instead
@@ -217,11 +222,11 @@ class CurationSession:
         reviewable = self.dataset[[c for c in self._SCORED_POOL_COLUMNS if c in self.dataset.columns]]
 
         pre_join_mask = pd.Series(True, index=reviewable.index)
-        if not self.include_already_labeled:
+        if self.only_already_labeled or not self.include_already_labeled:
             trusted_mask = reviewable["label_confidence"].isin(_TRUSTED_LABEL_CONFIDENCE) & reviewable[
                 "label"
             ].isin(["positive", "negative"])
-            pre_join_mask &= ~trusted_mask
+            pre_join_mask &= trusted_mask if self.only_already_labeled else ~trusted_mask
         if self.require_pmcid:
             pre_join_mask &= reviewable["pmcid"].notna() & (reviewable["pmcid"] != "")
         if not pre_join_mask.all():

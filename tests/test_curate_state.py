@@ -149,6 +149,37 @@ def test_include_already_labeled_toggle_restores_full_queue(tmp_path):
     assert set(session.queue) == {"rec1", "rec2", "rec3", "rec4"}
 
 
+def test_only_already_labeled_filters_queue_to_just_the_trusted_records(tmp_path):
+    # The inverse of include_already_labeled: instead of hiding (default) or merging in
+    # already-trusted records, restrict the queue to *just* rec1/rec2 (human_curated/
+    # registry_confirmed) -- for deliberately re-checking past decisions, not fresh review.
+    dataset_path = _write_dataset_with_mixed_trust(tmp_path / "canonical_dataset.csv")
+    session = CurationSession(
+        dataset_path=dataset_path,
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+        only_already_labeled=True,
+    )
+
+    assert session.total() == 2
+    assert set(session.queue) == {"rec1", "rec2"}
+
+
+def test_only_already_labeled_takes_precedence_over_include_already_labeled(tmp_path):
+    # Setting both flags is a real combination the UI can produce transiently (e.g. a stale
+    # widget default) -- only_already_labeled must still win rather than the two conflicting.
+    dataset_path = _write_dataset_with_mixed_trust(tmp_path / "canonical_dataset.csv")
+    session = CurationSession(
+        dataset_path=dataset_path,
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+        include_already_labeled=True,
+        only_already_labeled=True,
+    )
+
+    assert set(session.queue) == {"rec1", "rec2"}
+
+
 def test_require_pmcid_filters_queue_to_records_with_a_pmcid(tmp_path):
     dataset_path = _write_dataset_with_mixed_trust(tmp_path / "canonical_dataset.csv")
     session = CurationSession(
