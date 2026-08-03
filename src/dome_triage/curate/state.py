@@ -79,6 +79,11 @@ class CurationSession:
     # (see go_back()/go_forward()). `stats()`/`remaining()` are driven by `_frontier`, not
     # `_position`, so browsing back through past decisions doesn't make "remaining" fluctuate.
     _frontier: int = field(init=False, default=0)
+    # Memoizes _scored_pool() per instance -- it's called from __post_init__,
+    # score_band_summary(), and year_bounds() independently, and was measured recomputing the
+    # same result up to ~6 times in a single Curate-page rerun before this existed (see
+    # _scored_pool()'s own docstring for the incident).
+    _scored_pool_cache: Optional[pd.DataFrame] = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.dataset = pd.read_csv(self.dataset_path, dtype=str)
@@ -89,8 +94,7 @@ class CurationSession:
         )
         decided = set(self.events["record_id"]) if not self.events.empty else set()
 
-        scored = self._scored_pool()
-        reviewable = scored
+        reviewable = self._scored_pool()
 
         if self.score_band is not None:
             band_col = "match_score_band__bulk_match_score"
@@ -114,9 +118,15 @@ class CurationSession:
     def _scored_pool(self) -> pd.DataFrame:
         """Applies every filter *except* score_band/journals/year_range, and adds the score-band
         column (via build_strata, unconditionally -- not just when score_band filtering is
-        active) -- shared by __post_init__ (which goes on to apply the remaining three filters)
-        and score_band_summary() (which needs this same base population to report accurate
-        per-band totals regardless of which band, if any, is currently selected)."""
+        active) -- used by __post_init__ (which goes on to apply the remaining three filters),
+        score_band_summary(), and year_bounds(). Memoized on `_scored_pool_cache` -- a real,
+        measured incident: before this cache existed, those three call sites each independently
+        recomputed the same result (and `annotate_bulk_scores` was independently expensive too,
+        see its own docstring), measured at ~6 full recomputations for a single Curate-page
+        rerun, directly responsible for a 40-58s per-decision reload."""
+        if self._scored_pool_cache is not None:
+            return self._scored_pool_cache
+
         reviewable = self.dataset
         if not self.include_already_labeled:
             trusted_mask = self.dataset["label_confidence"].isin(_TRUSTED_LABEL_CONFIDENCE) & self.dataset[
@@ -139,29 +149,56 @@ class CurationSession:
             reviewable = reviewable[reviewable.get("needs_screening", pd.Series(dtype=bool)).fillna(False)]
 
         has_scores = "bulk_match_score" in reviewable.columns and reviewable["bulk_match_score"].notna().any()
-        return build_strata(
+        self._scored_pool_cache = build_strata(
             reviewable,
             score_col="bulk_match_score" if has_scores else None,
             n_score_bands=self.n_score_bands,
             top_n_journals=self.top_n_journals,
         )
+        return self._scored_pool_cache
+
+    def _confirmed_record_ids(self, candidate_ids) -> set:
+        """Which of `candidate_ids` have a genuine positive/negative decision -- trusted from a
+        prior round, or the *latest* event this session actually landing on positive/negative
+        (not skipped/undeterminable, which mean "not yet assessed"/"looked and couldn't tell",
+        neither of which is "curated" in the sense this is reporting). Used by
+        `score_band_summary()` -- a real, live bug this fixes: it used to count *any* event
+        (including Skip) as "confirmed", so a band containing a record you'd only Skipped this
+        session (or a trusted-but-skipped record from a prior round) showed a nonzero curated
+        count before you'd actually decided anything. `diversity_stats()` has its own,
+        differently-shaped but equally-correct version of this same check (it also needs each
+        confirmed record's *effective* label for grouping, not just membership) -- deliberately
+        left as-is rather than forced through this helper too, since it's already correct and
+        already tested."""
+        candidate_ids = set(candidate_ids)
+        trusted = set(
+            self.dataset.loc[
+                self.dataset["record_id"].isin(candidate_ids)
+                & self.dataset["label_confidence"].isin(_TRUSTED_LABEL_CONFIDENCE)
+                & self.dataset["label"].isin(["positive", "negative"]),
+                "record_id",
+            ]
+        )
+        decided = set()
+        if not self.events.empty:
+            latest = self.events.sort_values("timestamp").groupby("record_id").last()
+            decided = set(latest[latest["decision"].isin(["positive", "negative"])].index)
+        return (trusted | decided) & candidate_ids
 
     def score_band_summary(self) -> list[dict]:
         """One entry per score band (lowest to highest), for the filter widget's labels: the
         real numeric score range within that band, and how many of its records are already
-        confirmed (trusted, or decided this session) out of how many total -- so "Q1"/"Q4" stop
-        being opaque and show real numbers instead. Computed fresh from `_scored_pool()` (the
-        pre-score-band/journal/year-filtered population), so it doesn't shift confusingly just
-        because a *different* band is currently selected."""
+        confirmed (a genuine positive/negative decision -- trusted, or decided this session) out
+        of how many total -- so "Q1"/"Q4" stop being opaque and show real numbers instead.
+        Computed fresh from `_scored_pool()` (the pre-score-band/journal/year-filtered
+        population), so it doesn't shift confusingly just because a *different* band is currently
+        selected."""
         pool = self._scored_pool()
         band_col = "match_score_band__bulk_match_score"
         if band_col not in pool.columns or pool.empty:
             return []
 
-        reviewed_ids = set(self.events["record_id"]) if not self.events.empty else set()
-        confirmed_mask = pool["label_confidence"].isin(_TRUSTED_LABEL_CONFIDENCE) | pool["record_id"].isin(
-            reviewed_ids
-        )
+        confirmed_ids = self._confirmed_record_ids(pool["record_id"])
 
         summary = []
         for band in sorted(pool[band_col].dropna().unique()):
@@ -172,10 +209,23 @@ class CurationSession:
                     "min_score": float(band_df["bulk_match_score"].min()),
                     "max_score": float(band_df["bulk_match_score"].max()),
                     "total": int(len(band_df)),
-                    "confirmed": int(confirmed_mask[band_df.index].sum()),
+                    "confirmed": int(band_df["record_id"].isin(confirmed_ids).sum()),
                 }
             )
         return summary
+
+    def year_bounds(self) -> Optional[tuple]:
+        """(min_year, max_year) across the *currently filtered* population (same base as
+        score_band_summary() -- every filter except score_band/journals/year_range itself), not
+        the whole dataset -- so the year slider's own range reflects what's actually left to
+        pick from once you've, say, already filtered to BM25-classification=positive, rather than
+        always spanning the full corpus regardless of what else is selected. Returns None if the
+        filtered population has no parseable years at all (an edge case, not the common path)."""
+        pool = self._scored_pool()
+        years = pd.to_numeric(pool["year"], errors="coerce").dropna()
+        if years.empty:
+            return None
+        return (int(years.min()), int(years.max()))
 
     def diversity_stats(self) -> dict:
         """All-time/corpus-wide diversity of *confirmed* (trusted-source OR actually decided in
@@ -248,7 +298,7 @@ class CurationSession:
         return self._position > 0
 
     def can_go_forward(self) -> bool:
-        return self._position < self._frontier
+        return self._position < len(self.queue) - 1
 
     def go_back(self) -> None:
         """Moves the viewing cursor back one record -- to revisit and, if you want, change a
@@ -257,10 +307,13 @@ class CurationSession:
         self._position = max(0, self._position - 1)
 
     def go_forward(self) -> None:
-        """Re-approaches a record you've already passed (up to `_frontier`, the furthest point
-        reached) without deciding it again -- capped there so "forward" can't skip past
-        undecided territory; only an actual decision extends the frontier."""
-        self._position = min(self._frontier, self._position + 1)
+        """Moves the viewing cursor forward one record -- works regardless of whether the record
+        you're leaving (or the one you're moving to) has been decided yet; browsing is not gated
+        on deciding. Bounded only by the queue's actual length -- `_frontier` (used by
+        `remaining()`/`stats()`) is untouched by this, and only ever moves via a real decision in
+        `record_decision()`, so browsing forward through undecided territory doesn't silently
+        mark it as progress."""
+        self._position = min(len(self.queue) - 1, self._position + 1)
 
     def record_decision(
         self,

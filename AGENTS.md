@@ -110,6 +110,48 @@ schema of each real source file — they must never depend on the multi-GB sibli
 (`DOME_Top_Curate`, `DOME-Copilot-Data-Analysis`, etc.) being present, since those live outside
 this repo and aren't guaranteed to exist on every machine or in CI.
 
+**`streamlit.testing.v1.AppTest` smoke-checks of the Curate app must point at an isolated
+`tmp_path`, never the real `cfg.path("canonical_dataset")`/`cfg.pipeline["curation"]
+["events_log"]` paths.** A real incident: a smoke-test session clicked "Positive" against the
+live app pointed at real config paths, which genuinely appended a `curator="smoketest"` row to
+the actual `data/processed/curation_events.csv` -- indistinguishable from a real decision to
+anything downstream (`diversity_stats()`, `materialize_events()`, the curator's own review
+queue) until manually spotted and removed. `CurationSession` takes `dataset_path`/`events_path`
+directly for exactly this reason -- pass a `tmp_path`-based `canonical_dataset.csv` copy and a
+fresh `tmp_path` events file when driving the real page end-to-end, the same as any other test.
+The event log's rolling `*_backup.csv` sibling needs the same care -- it is written *before* every
+append, so a polluted run leaves fake rows there even after the main file is cleaned. Check both.
+
+## Curate app performance
+
+The Curate app re-executes its whole page script on every interaction (that is just how Streamlit
+works), so anything on that path runs tens of times per minute during real curation. Two rules,
+both learned from measured incidents that made a single click take 40-57 seconds:
+
+**Never do work that scales with the bulk-score lookup on the page path.** That lookup holds ~2.07
+million entries (3 id fields x ~745k bulk-pool rows) while the frame being annotated holds a few
+thousand. Anything O(lookup) dominates completely. This bit twice in the same function
+(`curate/bulk_scores.py::annotate_bulk_scores`): first as an explicit
+`{k: v[0] for k, v in lookup.items()}` rebuild per call (~9-10s), then -- after "fixing" it -- as
+`Series.map(lookup)`, which *looks* vectorized but makes pandas build a full 2.07M-element Series
+and Index internally before taking the few thousand values wanted (~2.5s). Use plain `lookup.get()`
+over the small frame's rows. `tests/test_bulk_scores.py::_NoScanDict` pins this: it raises if
+anything walks the whole mapping, so a well-meaning revert to `.map()` fails the suite rather than
+silently costing seconds again.
+
+**Don't call `st.rerun()` in a widget callback or click handler.** Streamlit already reruns the
+script on any widget interaction; an explicit `st.rerun()` on top forces a *second* full execution
+-- exactly doubling the cost -- for no behavioral gain. Mutate state and let the in-flight rerun
+render it (see `pages/1_Curate.py`'s Back/Forward handlers, which deliberately sit above
+`current_record()` for this reason).
+
+Profile before changing anything here: add temporary `print(..., flush=True)` timers, run the page
+headlessly through `AppTest` against the *real* data (with the events log redirected to a tmp dir,
+per the Testing rule above), and read the actual numbers. Every performance claim in this section
+came from that loop; every wrong guess along the way came from skipping it. Current measured
+baseline: ~10s one-time cold start (loading the 1.7GB scored CSV into the cached lookup, paid once
+per app process), then **~0.27s per decision or navigation click**.
+
 ## Data provenance
 
 Two complementary mechanisms, both mandatory:

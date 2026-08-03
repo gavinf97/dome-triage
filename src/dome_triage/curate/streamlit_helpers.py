@@ -24,7 +24,10 @@ def _cached_bulk_score_lookup(path: str, mtime: float) -> dict:
     """mtime-keyed, same precedent as 3_Keyword_Review.py's _load_candidates(path, mtime) --
     re-running `keywords score-bulk-match` invalidates this automatically. Built once, completely
     independent of whichever Curate-page filters are toggled (unlike get_session()'s cache key
-    below) -- a filter click must never re-read a ~1.7GB file."""
+    below) -- a filter click must never re-read a ~1.7GB file. Confirmed via live profiling this
+    part was never the problem -- ~17s on the first real MISS, ~0s on every call after (the actual
+    incident was downstream, in how the resulting ~2.07M-entry lookup got used per-call -- see
+    bulk_scores.py::annotate_bulk_scores and state.py::CurationSession._scored_pool)."""
     return load_bulk_score_lookup(Path(path))
 
 
@@ -102,7 +105,11 @@ def build_probe_session(
     are intentionally omitted here -- score_band_summary() doesn't depend on them anyway, see
     state.py). Reconstructing this every rerun is cheap (canonical_dataset.csv is small); calling
     get_session() twice with different keys in the same rerun would instead thrash its one cache
-    slot, reconstructing the *real* session pointlessly on every interaction."""
+    slot, reconstructing the *real* session pointlessly on every interaction. Confirmed cheap by
+    live profiling once `annotate_bulk_scores`'s per-call cost and `_scored_pool()`'s
+    within-instance redundancy were both fixed (see bulk_scores.py and state.py) -- before those
+    fixes, "cheap" was wrong: this alone cost 9-10s per call from `annotate_bulk_scores` and up to
+    ~30s once `_scored_pool()`'s redundant recomputation stacked on top."""
     cfg = get_config()
     return CurationSession(
         dataset_path=cfg.path("canonical_dataset"),

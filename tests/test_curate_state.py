@@ -429,6 +429,28 @@ def test_diversity_stats_reflects_live_session_decisions_before_materialize(tmp_
     assert after["n_journals_covered"] == before["n_journals_covered"] + 1
 
 
+def test_scored_pool_is_memoized_per_instance(tmp_path):
+    # Real, live incident this guards against: _scored_pool() was being recomputed independently
+    # by __post_init__, score_band_summary(), and year_bounds() -- up to ~6 full recomputations
+    # per Curate-page rerun, each one expensive (see annotate_bulk_scores' own fix) -- directly
+    # responsible for a 40-58s per-decision reload. Same object identity (not just equal values)
+    # on repeat access proves it's genuinely cached, not just coincidentally fast.
+    dataset_path = _write_dataset_for_filters(tmp_path / "canonical_dataset.csv")
+    session = CurationSession(
+        dataset_path=dataset_path,
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+        bulk_score_lookup=_FILTER_SCORE_LOOKUP,
+    )
+    first = session._scored_pool()
+    second = session._scored_pool()
+    assert first is second
+    # score_band_summary()/year_bounds() must reuse the same cached pool too, not their own copy
+    session.score_band_summary()
+    session.year_bounds()
+    assert session._scored_pool() is first
+
+
 def test_score_band_summary_reports_real_ranges_and_curated_counts(tmp_path):
     dataset_path = _write_dataset_for_filters(tmp_path / "canonical_dataset.csv")
     session = CurationSession(
@@ -466,6 +488,48 @@ def test_score_band_summary_reflects_confirmed_decisions(tmp_path):
     assert low["confirmed"] == 1
 
 
+def test_score_band_summary_does_not_count_skipped_or_undeterminable_as_confirmed(tmp_path):
+    # Real, live bug this fixes: Skip/Undeterminable explicitly mean "not yet assessed" /
+    # "looked and couldn't tell" -- neither is "curated", so a freshly-opened session where you've
+    # only skipped things must show 0 confirmed, not a nonzero count for that band.
+    dataset_path = _write_dataset_for_filters(tmp_path / "canonical_dataset.csv")
+    session = CurationSession(
+        dataset_path=dataset_path,
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+        bulk_score_lookup=_FILTER_SCORE_LOOKUP,
+        n_score_bands=2,
+    )
+    session.record_decision("skipped")  # rec1 (PMC1, score 10 -> low band)
+    session.record_decision("undeterminable")  # rec2 (PMC2, score 200 -> high band)
+
+    summary = session.score_band_summary()
+    low = next(s for s in summary if s["band"] == 0)
+    high = next(s for s in summary if s["band"] == 1)
+    assert low["confirmed"] == 0
+    assert high["confirmed"] == 0
+
+
+def test_year_bounds_reflects_filtered_population_not_whole_dataset(tmp_path):
+    dataset_path = _write_dataset_for_filters(tmp_path / "canonical_dataset.csv")  # years 2015-2022
+    session = CurationSession(
+        dataset_path=dataset_path,
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+        classification=["positive"],  # rec2 (2022) and rec3 (2020) only, per _FILTER_SCORE_LOOKUP
+        bulk_score_lookup=_FILTER_SCORE_LOOKUP,
+    )
+    assert session.year_bounds() == (2020, 2022)
+
+
+def test_year_bounds_unfiltered_spans_whole_dataset(tmp_path):
+    dataset_path = _write_dataset_for_filters(tmp_path / "canonical_dataset.csv")
+    session = CurationSession(
+        dataset_path=dataset_path, events_path=tmp_path / "events.csv", curator="alice"
+    )
+    assert session.year_bounds() == (2015, 2022)
+
+
 def test_go_back_and_go_forward_navigate_without_changing_remaining(tmp_path):
     dataset_path = _write_dataset(tmp_path / "canonical_dataset.csv")
     session = CurationSession(
@@ -486,16 +550,32 @@ def test_go_back_and_go_forward_navigate_without_changing_remaining(tmp_path):
     assert session.can_go_forward()
     session.go_forward()
     assert session.current_record()["record_id"] == "rec2"
-    assert not session.can_go_forward()  # back at the frontier, nothing further to re-approach
+    # rec3 still exists ahead in the queue -- forward keeps working past the decided frontier,
+    # browsing is not gated on having decided anything.
+    assert session.can_go_forward()
 
 
-def test_go_forward_is_capped_at_frontier_not_full_queue(tmp_path):
+def test_go_forward_works_before_anything_is_decided(tmp_path):
+    # Real requirement, not hypothetical: forward/back must work regardless of whether you've
+    # curated yet -- pure browsing, not gated on decision progress.
     dataset_path = _write_dataset(tmp_path / "canonical_dataset.csv")
     session = CurationSession(
         dataset_path=dataset_path, events_path=tmp_path / "events.csv", curator="alice"
     )
-    session.go_forward()  # nothing decided yet -- must be a no-op, not skip ahead undecided
+    assert session.can_go_forward()
+    session.go_forward()
+    assert session.current_record()["record_id"] == "rec2"
+    # remaining/decided must NOT move just from browsing -- nothing has actually been decided
+    assert session.stats() == {"total": 3, "decided": 0, "remaining": 3}
+
+    session.go_forward()
+    assert session.current_record()["record_id"] == "rec3"
+    assert not session.can_go_forward()  # at the end of the queue, nothing further to browse to
+
+    session.go_back()
+    session.go_back()
     assert session.current_record()["record_id"] == "rec1"
+    assert not session.can_go_back()
 
 
 def test_revisiting_and_redeciding_a_record_advances_past_the_original_frontier(tmp_path):

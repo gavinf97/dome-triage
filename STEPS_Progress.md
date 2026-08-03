@@ -926,10 +926,24 @@ columns, same reasoning as Step 12's `already_curated`):
 - **Match-score band** — quartiles of `match_score__bm25`, computed fresh over whatever's
   currently in the queue (not Step 13's original 745k-pool-wide bands, which would be less useful
   once the queue is already a small, pre-stratified subset).
-- **Journal** — top-N by volume (same bucketing Step 13 uses), or `other` for everything else.
-- **Year** — one range slider; collapse both handles to the same year to pick a single year.
+  Each band's label shows its **real BM25 range and how many of its records are already
+  curated** (e.g. `Q1 (lowest): BM25 5.2-40.1 -- 12/340 curated`), so "Q1"/"Q4" aren't opaque.
+  "Curated" here means a genuine positive/negative decision — a Skip or Undeterminable does not
+  count (it means "not assessed"/"looked and couldn't tell", neither of which is a label).
+- **Journal** — type-to-search over **every journal in the dataset**, not a top-N shortlist.
+- **Year** — one range slider; collapse both handles to the same year to pick a single year. Its
+  bounds reflect the **currently filtered** population, not the whole corpus — so after filtering
+  to e.g. classification=positive, the slider spans only years actually present among those.
 - **BM25 classification** — positive/negative, straight from Step 12.
 - **Needs-screening-only** — Step 14b's flagged clear-negatives, for batch-reviewing them together.
+
+**Keyboard-first**: **P** = Positive, **N** = Negative, **U** = Undeterminable, **S** = Skip. Each
+submits and advances immediately (no separate confirm step — that's slower for rapid review).
+Shortcuts are ignored while you're typing in Notes, so "n" types a letter there. **< Back** and
+**Forward >** browse the queue freely in either direction, whether or not the records involved
+have been decided — browsing is never gated on deciding, and moving around doesn't alter the
+"remaining" count. Revisiting a record you already decided this session shows a banner saying so;
+deciding again simply supersedes the earlier decision (last one wins).
 
 **Diversity tracker (sidebar, "Diversity tracker" expander)** — deliberately **all-time/
 corpus-wide, not scoped to whatever filter is active** (a decision's diversity contribution
@@ -948,14 +962,24 @@ also shows directly on the page, not just in the sidebar.
 whatever it started as) — so a record that was `heuristic_candidate` before you decided it becomes
 fully trusted once materialized, same as any other human-curated source.
 
-One paper at a time: title/journal/year/MeSH/abstract shown, plus the structured feature
-checklist from `configs/curation_features.yaml`:
-- Applies ML/AI to empirical data? (bool)
-- Proposes a novel algorithm? (bool)
-- Primary domain area (genomics / imaging / clinical / environmental / chemistry / other)
-- If negative — why? (theoretical-method-only / generic-nlp-extraction-only /
-  wrong-domain-non-bio / review-mentions-ml-only / other) — only shown when decision=negative
-- Your confidence (low / medium / high)
+One paper at a time: title, then **Journal:** and **Year:** as separate labelled fields, the BM25
+match score (with a tooltip explaining what the number means against Step 11's validated Youden
+threshold — it's a triage ranking signal, not a verdict), MeSH terms where the record has them,
+and the abstract in a fixed-height scrollable panel so the decision buttons never move down the
+page as abstract length varies.
+
+> **On MeSH terms**: only ~35% of the reviewable queue has any `mesh_headings` at all, and in the
+> default unfiltered order the first record that does doesn't appear until roughly position 563 —
+> so seeing no MeSH line for a long opening run is expected, not a bug.
+
+Alongside: a free-text **Notes** box, and the structured feature checklist from
+`configs/curation_features.yaml` — deliberately trimmed to just **"If negative — why?"**
+(theoretical-method-only / generic-nlp-extraction-only / wrong-domain-non-bio /
+review-mentions-ml-only / other). The earlier bulk of per-paper checkboxes was removed: at
+~5,000 papers, every extra field is multiplied by 5,000, and the ones dropped were either
+inferable later from the text or not load-bearing for the BERT fine-tune this dataset feeds.
+`configs/curation_features.yaml` is still a living list — add a field back if you find you
+genuinely want it.
 
 Decision options: **Positive / Negative / Undeterminable / Skipped**.
 
@@ -968,6 +992,14 @@ Decision options: **Positive / Negative / Undeterminable / Skipped**.
 
 Every decision is appended to `curation_events.csv` (append-only, resumable, backed up) — safe
 to stop and restart any time.
+
+**Responsiveness**: the first page load after `docker compose up curate` takes **~10 seconds** —
+that's reading the 1.7GB `bulk_candidates_scored.csv` into the cached score lookup, and it's paid
+**once per app process**, not per interaction. After that, every decision and every Back/Forward
+click is **~0.3 seconds**. If you ever see multi-second waits *per decision*, something has
+regressed on the page path — see AGENTS.md's "Curate app performance" section, which documents the
+two root causes already found and fixed (both made a single click take 40-57s) and the profiling
+method for finding a third.
 
 ### 15b — Conflicts page
 Resolves the **9 flagged conflicts** from Step 2 (`conflicts_for_review.csv`) — side-by-side

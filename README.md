@@ -28,6 +28,18 @@ This repo consolidates and builds on several earlier, disconnected efforts in th
 None of these talk to each other, and none has ontology mapping or a trained classifier — that's
 what this repo is for. See `ROADMAP.md` for the full phase breakdown and current status.
 
+## Key documents
+
+| File | What it's for |
+|---|---|
+| [`ROADMAP.md`](ROADMAP.md) | Phase plan (0–8), human-in-the-loop checkpoint map, Model Evaluation Standards |
+| [`STEPS_Progress.md`](STEPS_Progress.md) | Step-by-step runbook with a live decision log and per-step results |
+| [`METHODS_REVIEW.md`](METHODS_REVIEW.md) | Scientific audit of the approach so far + the classifier/tagging model plan |
+| [`PREPROCESSING.md`](PREPROCESSING.md) | Every text-preprocessing choice, justified, with known limitations |
+| [`SCORING_BAKEOFF_RESULTS.md`](SCORING_BAKEOFF_RESULTS.md) | Full Step 11 relevance-scorer comparison, explained figure by figure |
+| [`curation_criteria/CRITERIA.md`](curation_criteria/CRITERIA.md) | Your living rulebook for what counts as Positive/Negative/Undeterminable/Skipped |
+| [`AGENTS.md`](AGENTS.md) | Repo conventions: Docker-only execution, testing rules, disk hygiene, Curate-app performance |
+
 ## Design philosophy: human-led, fully traceable
 
 This pipeline is built to be run **manually, one step at a time, by a person following along** —
@@ -83,18 +95,41 @@ Every step reads/writes plain CSV/JSONL files under `data/` (gitignored) via pat
 
 ## Status
 
+**Phase 1 is complete through Step 13; manual curation (Step 15) is the active step.**
+
+Where the data stands (verified 2026-08-02):
+
+| | |
+|---|---|
+| Canonical dataset | 6,647 records |
+| Definitively labeled | 3,785 (1,878 positive / 1,907 negative) |
+| Curation queue awaiting review | 2,328 |
+| Keyword lexicon | 296 positive terms / 18 exclusionary |
+| Europe PMC AI/ML bulk pool | 744,647 records, BM25-scored |
+| Chosen relevance scorer | `bm25` + exclusionary lexicon (Youden threshold 107.6) |
+
 **Implemented:** repo scaffold, Docker, data consolidation across the existing labeled sources
 into one canonical dataset with full provenance and conflict-flagging, a Dockerized Streamlit
-curation app (with MeSH display, structured feature capture, and a genuine Undeterminable
+curation app (keyboard-driven P/N/U/S decisions, score-band/journal/year/classification filters,
+live diversity dashboard, MeSH display, structured feature capture, and a genuine Undeterminable
 outcome), TF-IDF + KeyBERT keyword extraction with a threshold tool and human review checkpoint,
 bulk blunt-match candidate construction against Europe PMC with full metadata capture (including
 MeSH headings), an empirically-validated relevance-scoring bake-off (BM25/TF-IDF-cosine/
-weighted-sum), stratified sampling, a clear-negative sampler, and a project-wide provenance
-ledger.
+weighted-sum), stratified sampling, a clear-negative sampler with strong-negative screening, and a
+project-wide provenance ledger.
+
+**On hold by explicit decision:** Steps 14/14b (clear-negative fetch + screening) are built and
+tested but deliberately not run yet — the plan is to complete a real manual curation pass first,
+then revisit expanding the negative pool. See `STEPS_Progress.md`.
 
 **Not yet built** (specified in `ROADMAP.md`): domain-science/EDAM tagging beyond the MeSH
 headings already captured, baseline and BERT/LLM classifiers, probability calibration and
 confidence-based routing, the bulk historical Europe PMC scan, and the daily production pipeline.
+
+**Before the modelling phases**, see [`METHODS_REVIEW.md`](METHODS_REVIEW.md) — an audit of the
+approach so far (retrieval coverage, the BM25/lexicon scoring mechanism, evaluation validity,
+dataset confounds) and the plan for the relevance classifier plus DOME-aligned model-type tagging.
+It flags four cheap fixes worth making *before* curating substantially more data.
 
 ## License
 

@@ -65,28 +65,47 @@ def annotate_bulk_scores(
     score_out_col: str = "bulk_match_score",
     classification_out_col: str = "bulk_match_classification",
 ) -> pd.DataFrame:
-    """Vectorized pmcid->pmid->doi fallback join (`.map()`, not `.iterrows()` -- this codebase
-    learned the hard way that row-by-row is too slow even at bulk-pool scale; here `dataset` is
-    small, but the pattern stays consistent with `_annotate_already_curated`). Returns a copy;
-    never writes back to `dataset` or to disk."""
+    """pmcid->pmid->doi fallback join in a single pass over `dataset`'s rows, short-circuiting on
+    the first id field that hits. Returns a copy; never writes back to `dataset` or to disk.
+
+    Deliberately does NOT use `Series.map(lookup)`, despite that being the idiomatic-looking
+    choice, and this is the second time the same class of bug has been fixed here -- both found by
+    live profiling, both worth stating so it doesn't get "cleaned up" back into one:
+
+      1. An earlier version rebuilt `{k: v[0] for k, v in lookup.items()}` (and the same for
+         `v[1]`) on *every call*. At `lookup`'s real size -- ~2.07 million entries (3 id fields x
+         ~745k bulk-pool rows) -- that unzip alone cost ~9-10s per call.
+      2. Replacing that with `Series.map(lookup)` looked vectorized but was still ~2.5s per call,
+         because pandas' `map_array` fast-paths a plain dict by doing `Series(mapper)` -- building
+         a full 2.07M-element Series *and* Index and hashing every key -- before taking the 2,862
+         values actually wanted. Cost scales with the dict, not the Series, which is the opposite
+         of what the code reads like. (A dict subclass defining `__missing__` takes a different
+         pandas branch, but relying on that is far more obscure than just not calling `.map()`.)
+
+    Iterating `dataset`'s few thousand rows and calling `lookup.get()` is O(rows) with O(1) gets --
+    it never touches the other ~2.07M entries at all. This is not the `.iterrows()` pattern this
+    codebase avoids at bulk-pool scale: it's a plain zip over 1-3 already-extracted columns of a
+    small frame, and it measured ~2.5s -> ~0.01s."""
     dataset = dataset.copy()
-    score_lookup = {k: v[0] for k, v in lookup.items()}
-    classification_lookup = {k: v[1] for k, v in lookup.items()}
+    id_cols = [f for f in _ID_FIELDS if f in dataset.columns]
+    if not id_cols:
+        dataset[score_out_col] = None
+        dataset[classification_out_col] = ""
+        return dataset
 
-    score = None
-    classification = None
-    for id_field in _ID_FIELDS:
-        if id_field not in dataset.columns:
-            continue
-        mapped_score = dataset[id_field].map(score_lookup)
-        mapped_classification = dataset[id_field].map(classification_lookup)
-        score = mapped_score if score is None else score.fillna(mapped_score)
-        classification = (
-            mapped_classification if classification is None else classification.fillna(mapped_classification)
-        )
+    scores: list = []
+    classifications: list = []
+    for row_ids in zip(*(dataset[c] for c in id_cols)):
+        hit = None
+        for value in row_ids:
+            hit = lookup.get(value)
+            if hit is not None:
+                break
+        scores.append(hit[0] if hit is not None else None)
+        classifications.append(hit[1] if hit is not None else "")
 
-    dataset[score_out_col] = score
-    dataset[classification_out_col] = classification.fillna("") if classification is not None else ""
+    dataset[score_out_col] = scores
+    dataset[classification_out_col] = classifications
     return dataset
 
 
@@ -116,15 +135,26 @@ def load_screening_lookup(screened_path: Path) -> dict[str, bool]:
 
 
 def annotate_screening(dataset: pd.DataFrame, lookup: dict[str, bool], out_col: str = "needs_screening") -> pd.DataFrame:
-    """Same fallback-join pattern as `annotate_bulk_scores`, for the boolean screening flag."""
+    """Same single-pass fallback-join as `annotate_bulk_scores` (see its docstring for why
+    `Series.map(lookup)` is deliberately avoided -- the same pandas cost applies here, and this
+    lookup reaches comparable size once Step 14b has run over a full clear-negative batch), for the
+    boolean screening flag."""
     dataset = dataset.copy()
-    flag = None
-    for id_field in _ID_FIELDS:
-        if id_field not in dataset.columns:
-            continue
-        mapped = dataset[id_field].map(lookup)
-        flag = mapped if flag is None else flag.fillna(mapped)
-    dataset[out_col] = (flag.fillna(False) if flag is not None else pd.Series(False, index=dataset.index)).astype(bool)
+    id_cols = [f for f in _ID_FIELDS if f in dataset.columns]
+    if not id_cols:
+        dataset[out_col] = False
+        return dataset
+
+    flags: list = []
+    for row_ids in zip(*(dataset[c] for c in id_cols)):
+        hit = None
+        for value in row_ids:
+            hit = lookup.get(value)
+            if hit is not None:
+                break
+        flags.append(bool(hit))
+
+    dataset[out_col] = flags
     return dataset
 
 

@@ -98,11 +98,16 @@ with st.expander("Filters", expanded=False):
         "Journal (type to search -- every journal in the dataset, not just a top-N shortlist)",
         options=_filter_options["journals"],
     )
+
+    # Year bounds come from the probe (the currently-filtered population), not the whole dataset
+    # -- e.g. once you've filtered to classification=positive, the slider should only span years
+    # actually present among positive-classified records, not the full corpus's range.
+    _year_min, _year_max = probe.year_bounds() or (_filter_options["year_min"], _filter_options["year_max"])
     year_range = st.slider(
-        "Year range",
-        min_value=_filter_options["year_min"],
-        max_value=_filter_options["year_max"],
-        value=(_filter_options["year_min"], _filter_options["year_max"]),
+        "Year range (bounds reflect the filters above, not the whole dataset)",
+        min_value=_year_min,
+        max_value=_year_max,
+        value=(_year_min, _year_max),
         help="Collapse both handles to the same year to pick a single year.",
     )
 
@@ -111,7 +116,7 @@ session = get_session(
     require_pmcid=require_pmcid,
     score_band=score_band or None,
     journals=journals or None,
-    year_range=year_range if year_range != (_filter_options["year_min"], _filter_options["year_max"]) else None,
+    year_range=year_range if year_range != (_year_min, _year_max) else None,
     classification=classification or None,
     needs_screening_only=needs_screening_only,
 )
@@ -134,23 +139,34 @@ with st.sidebar.expander("Diversity tracker", expanded=False):
             .head(20)
         )
 
+# ---------------------------------------------------------------------------------------------
+# Progress + navigation. Uses `on_click` rather than `if button:` + `st.rerun()`, for two separate
+# reasons that both matter:
+#   - No st.rerun(): Streamlit already reruns the script on any widget click, so an explicit one
+#     forces a *second* full execution (re-reading both CSVs, rebuilding the scored pool) for zero
+#     gain -- measured live as an exact doubling of the page's wall time.
+#   - on_click, not `if button:`: callbacks run *before* the script body, so the move is already
+#     applied when these buttons compute their own `disabled` state below. With `if button:` the
+#     move happens after they've rendered, leaving both buttons a full interaction stale (clicking
+#     Forward off position 0 correctly showed the next paper but left "< Back" greyed out).
+# ---------------------------------------------------------------------------------------------
+nav_prog, nav_back, nav_fwd = st.columns([6, 1, 1])
+nav_prog.caption(f"{session.remaining()} of {session.total()} remaining (this filtered view)")
+nav_back.button(
+    "< Back", disabled=not session.can_go_back(), on_click=session.go_back, use_container_width=True
+)
+nav_fwd.button(
+    "Forward >",
+    disabled=not session.can_go_forward(),
+    on_click=session.go_forward,
+    use_container_width=True,
+)
+
 record = session.current_record()
 
 if record is None:
     st.success("No records left to curate.")
     st.stop()
-
-# ---------------------------------------------------------------------------------------------
-# Progress + navigation
-# ---------------------------------------------------------------------------------------------
-nav_prog, nav_back, nav_fwd = st.columns([6, 1, 1])
-nav_prog.caption(f"{session.remaining()} of {session.total()} remaining (this filtered view)")
-if nav_back.button("< Back", disabled=not session.can_go_back(), use_container_width=True):
-    session.go_back()
-    st.rerun()
-if nav_fwd.button("Forward >", disabled=not session.can_go_forward(), use_container_width=True):
-    session.go_forward()
-    st.rerun()
 
 prior_decision = session.current_record_prior_decision()
 if prior_decision:
@@ -178,9 +194,19 @@ if needs_screening:
 # ---------------------------------------------------------------------------------------------
 st.markdown(f"### {record.get('title') or '(no title)'}", unsafe_allow_html=True)
 
+def _display_year(value) -> str:
+    """Real years in canonical_dataset.csv are string-formatted floats ("2025.0") -- a pre-existing
+    artifact of the consolidate pipeline's CSV round-tripping (see sampling/stratified.py, which
+    handles the same thing). Rendering that raw put "Year: 2025.0" on every single paper."""
+    try:
+        return str(int(float(value)))
+    except (TypeError, ValueError):
+        return "(unknown)"
+
+
 meta_col1, meta_col2 = st.columns(2)
 meta_col1.markdown(f"**Journal:** {record.get('journal') or '(unknown)'}", unsafe_allow_html=True)
-meta_col2.markdown(f"**Year:** {record.get('year') or '(unknown)'}")
+meta_col2.markdown(f"**Year:** {_display_year(record.get('year'))}")
 
 bm25_score = record.get("bulk_match_score")
 bm25_classification = record.get("bulk_match_classification")
