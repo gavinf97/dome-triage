@@ -756,6 +756,61 @@ themselves scale with the *data*, not the pool size, so this estimate likely sti
 but check the `stratum_report.csv` `available` column once run). Edit `cap_per_stratum` in
 `configs/sampling.yaml` before running if you want more/fewer — it's the one knob to change.
 
+**Exactly how Q1–Q4 (and the rest of the strata) are computed — every step, no hand-waving**
+(`src/dome_triage/sampling/stratified.py::build_strata` + `stratified_sample`, called from
+`pipeline/steps.py::step_sampling_stratify`, config in `configs/sampling.yaml`'s `strata:`/
+`sampling:` blocks):
+
+1. **Score bands (Q1–Q4) are quantile bins, not equal-width score ranges.**
+   `pd.qcut(df["match_score__bm25"], q=n_score_bands=4, labels=False, duplicates="drop")`. `qcut`
+   splits by **rank**, not by score value — each band gets (as close to as possible)
+   **the same number of records**, not the same width of score. Concretely, from a real run:
+   Q1 (lowest) spanned BM25 scores roughly −10.0 to 38.2, Q4 (highest) spanned roughly 166.0 to
+   605.6 — the bands are *not* even-width buckets of that ~615-point range, they're "the bottom
+   quarter of records by rank" through "the top quarter by rank." `duplicates="drop"` merges
+   adjacent bands if the score distribution has enough exact ties at a boundary to make a clean
+   4-way split impossible (not observed as an issue on the real 745k pool, but the reason it's
+   there rather than crashing). This is a deterministic function of the score column — no
+   randomness in *which* band a record falls into, only in which records get *sampled* from
+   within a band (step 4 below).
+2. **Journal bucketing**: the top `top_n_journals=15` journals by raw frequency in the population
+   being bucketed become their own bucket; every other journal collapses into a single `"other"`
+   bucket (`df["journal"].value_counts().head(15)`, then `.where(...isin(top), "other")`). This is
+   why the *filter widget*'s journal picker (a full-corpus type-to-search list, unrelated to this
+   15-journal cap) can select a journal that the *stratification* itself treated as "other" — the
+   two are separate mechanisms serving different purposes (filtering an already-built queue vs.
+   building the queue's diversity in the first place).
+3. **Year bucketing**: `(year // 5) * 5` — flat 5-year-wide bins (2015, 2020, 2025, …), floor
+   division, not quantile-based like the score bands. `year_bucket_width: 5` in
+   `configs/sampling.yaml` is the one knob for this.
+4. **Random sampling within each stratum** — this is the actual "randomization algorithm" the
+   sampled *rows* come from. `stratified_sample()` groups the 745k-row pool by the three bucket
+   columns above (`(score_band, journal_bucket, year_bucket)` — e.g. real strata from
+   `stratum_report.csv` include cells like `(band=0, "Diagnostics (Basel, Switzerland)", 2020)`
+   with 422 records available), then for every group larger than `cap_per_stratum`, calls
+   **pandas' `DataFrame.sample(n=cap_per_stratum, random_state=42)`** — uniform sampling *without
+   replacement* within that group, using NumPy's default PCG64 bit generator seeded by
+   `random_state=42`. This is fully deterministic and reproducible: the same input data +
+   `cap_per_stratum` + `random_state` always produces the exact same sampled rows, byte-for-byte —
+   re-running `sampling stratify` with unchanged inputs is a no-op in terms of which records get
+   picked. Groups with `available <= cap_per_stratum` contribute every one of their records (no
+   sampling needed, no randomness involved for that group). `stratum_report.csv` records
+   `available`/`sampled` per stratum so any underfilled cell is directly visible, not hidden inside
+   an aggregate count.
+5. **Merge into `canonical_dataset.csv`**: the sampled rows are deduped against what's already
+   there by pmcid/pmid/doi (`_merge_new_candidates_into_canonical`) before being appended — a
+   record already present (e.g. from a prior curation round) is never re-added as a duplicate row.
+
+**This is deliberately the *only* place quartile score bands exist.** They describe how Step 13
+built *this specific, size-capped queue* — they say nothing about the full 745k pool's own score
+distribution, and Step 15a's Curate-page score-band filter recomputes them fresh over whatever
+subset of the queue is currently visible (see that section) rather than replaying these exact
+band edges. If you want to browse the **full, unstratified 745k pool** directly — ranked by raw
+BM25 score, picking your own starting figure rather than a quartile — that's the separate "Full
+AI/ML bulk pool" queue source in the Curate app's Step 15a, which deliberately bypasses this
+whole stratification/sampling mechanism (no `qcut`, no per-stratum cap, no `random_state` — every
+record in the pool is reachable, just ordered highest-score-first).
+
 **Command:**
 ```bash
 docker compose run --rm pipeline dome-triage sampling stratify
@@ -919,23 +974,47 @@ docker compose up curate
 
 ### 15a — Curate page (main queue)
 
+**Queue source (always visible, above the Filters expander)** — a choice between:
+- **Curation queue (Step 13 stratified sample)** — the default, everything described below as
+  before: the diverse, size-capped sample already merged into `canonical_dataset.csv`.
+- **Full AI/ML bulk pool (~745k, ranked by BM25)** — bypasses Step 13's stratification entirely
+  and browses/curates directly from every record `bulk_candidates_scored.csv` holds
+  (`src/dome_triage/curate/bulk_pool.py`), always ordered highest-score-first. Use this to look
+  beyond the pre-stratified sample, or to start from a specific point in the ranking rather than a
+  quartile. A decision made here on a record `canonical_dataset.csv` has never seen is not lost —
+  `curate materialize` (Step 16) inserts a new row for it (same `record_id` a real `dedupe
+  consolidate` run would eventually produce for that pmcid/pmid/doi, via
+  `dedupe.keys.record_id_from_ids`) rather than silently dropping the event. Switching sources
+  keeps your position in each source separately (each is its own cached session).
+
 **Filters (collapsed "Filters" expander at the top, on/off toggleable, composable)** — join
 `bulk_candidates_scored.csv`'s BM25 score/classification onto the queue at read time
 (`src/dome_triage/curate/bulk_scores.py`; `canonical_dataset.csv` itself never gains these
-columns, same reasoning as Step 12's `already_curated`):
-- **Match-score band** — quartiles of `match_score__bm25`, computed fresh over whatever's
-  currently in the queue (not Step 13's original 745k-pool-wide bands, which would be less useful
-  once the queue is already a small, pre-stratified subset).
-  Each band's label shows its **real BM25 range and how many of its records are already
-  curated** (e.g. `Q1 (lowest): BM25 5.2-40.1 -- 12/340 curated`), so "Q1"/"Q4" aren't opaque.
-  "Curated" here means a genuine positive/negative decision — a Skip or Undeterminable does not
-  count (it means "not assessed"/"looked and couldn't tell", neither of which is a label).
+columns, same reasoning as Step 12's `already_curated`). Journal/year/classification work the same
+in either queue source; **the score control itself differs by source**:
+- **Match-score band** (stratified-queue source only) — quartiles of `match_score__bm25`, computed
+  fresh over whatever's currently in the queue (not Step 13's original 745k-pool-wide bands, which
+  would be less useful once the queue is already a small, pre-stratified subset). Each band's
+  label shows its **real BM25 range and how many of its records are already curated** (e.g. `Q1
+  (lowest): BM25 5.2-40.1 -- 12/340 curated`), so "Q1"/"Q4" aren't opaque. "Curated" here means a
+  genuine positive/negative decision — a Skip or Undeterminable does not count (it means "not
+  assessed"/"looked and couldn't tell", neither of which is a label). See the stratification
+  explainer under Step 13 above for exactly how these bands, the journal bucketing, and the
+  per-stratum random sample were computed.
+- **BM25 score range** (bulk-pool source only) — two number inputs, "start browsing at ≤" and
+  "...down to ≥", bounded by the real pool min/max — pick any figure, not just a quartile edge, and
+  the queue starts exactly there (always sorted highest-to-lowest). The **validated Youden
+  threshold** (Step 11's bake-off, currently 107.6) is shown explicitly alongside these inputs — a
+  signpost for roughly where the lexicon match starts to look unreliable in aggregate, not a cutoff
+  enforced anywhere in this view.
 - **Journal** — type-to-search over **every journal in the dataset**, not a top-N shortlist.
 - **Year** — one range slider; collapse both handles to the same year to pick a single year. Its
   bounds reflect the **currently filtered** population, not the whole corpus — so after filtering
   to e.g. classification=positive, the slider spans only years actually present among those.
 - **BM25 classification** — positive/negative, straight from Step 12.
-- **Needs-screening-only** — Step 14b's flagged clear-negatives, for batch-reviewing them together.
+- **Needs-screening-only** (stratified-queue source only) — Step 14b's flagged clear-negatives, for
+  batch-reviewing them together; not applicable to the bulk pool (Step 14b screens the
+  clear-negative candidates, a different file, not the AI/ML-matched pool).
 
 **Keyboard-first**: **P** = Positive, **N** = Negative, **U** = Undeterminable, **S** = Skip. Each
 submits and advances immediately (no separate confirm step — that's slower for rapid review).
@@ -965,8 +1044,8 @@ fully trusted once materialized, same as any other human-curated source.
 One paper at a time: title, then **Journal:** and **Year:** as separate labelled fields, the BM25
 match score (with a tooltip explaining what the number means against Step 11's validated Youden
 threshold — it's a triage ranking signal, not a verdict), MeSH terms where the record has them,
-and the abstract in a fixed-height scrollable panel so the decision buttons never move down the
-page as abstract length varies.
+and the **full abstract, always fully visible** — no fixed-height scroll box, so nothing is hidden
+below a scroll boundary during fast curation.
 
 > **On MeSH terms**: only ~35% of the reviewable queue has any `mesh_headings` at all, and in the
 > default unfiltered order the first record that does doesn't appear until roughly position 563 —
@@ -980,6 +1059,19 @@ review-mentions-ml-only / other). The earlier bulk of per-paper checkboxes was r
 inferable later from the text or not load-bearing for the BERT fine-tune this dataset feeds.
 `configs/curation_features.yaml` is still a living list — add a field back if you find you
 genuinely want it.
+
+**The negative-reason picker is a row of small, numbered, hoverable buttons** (1–5 currently),
+visually separated above the P/N/U/S row — not a dropdown, and not stacked on top of the decision
+buttons. Hovering a button shows the full rule text from `configs/curation_features.yaml`'s
+`descriptions:` map (kept in sync with `curation_criteria/CRITERIA.md`'s "Negative" section — edit
+the criteria doc first, mirror the wording back into the yaml). Clicking one (or pressing its
+number key, 1–9) only *selects* it — it does **not** submit a decision, exactly like clicking it
+a second time deselects it. Only clicking **Negative** (or pressing **N**) submits, at which point
+whichever reason is currently selected gets attached to that decision; picking a reason and then
+clicking Positive/Undeterminable/Skip instead does *not* attach it (the config's
+`shown_when_decision: negative` is enforced at submit time). The option list is a living config —
+add a 6th (or 10th) reason in the yaml and it appears automatically, numbered in order, with no
+code change needed.
 
 Decision options: **Positive / Negative / Undeterminable / Skipped**.
 

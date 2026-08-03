@@ -152,6 +152,83 @@ came from that loop; every wrong guess along the way came from skipping it. Curr
 baseline: ~10s one-time cold start (loading the 1.7GB scored CSV into the cached lookup, paid once
 per app process), then **~0.27s per decision or navigation click**.
 
+**Watch memory, not just wall time, for anything caching a DataFrame built from the ~745k-row bulk
+pool.** `curate/bulk_pool.py::load_bulk_pool()` (backs the Curate page's "Full AI/ML bulk pool"
+queue source) OOM-killed the host in real use: `journalctl -k` showed a `python` process killed at
+~8.7GB RSS, `task_memcg=.../docker-...scope`. Root cause had two parts, both worth knowing about
+before touching this path again:
+1. Including `authors`/`pub_types` in `pd.read_csv(..., usecols=[...])` pushed the C engine's
+   *parsing-time* peak RSS to ~5.6GB, even though the resulting DataFrame's own `.memory_usage
+   (deep=True)` was only ~1.5GB -- and that gap **does not close** on `del df; gc.collect()`
+   (classic CPython/glibc behavior: freed heap arenas aren't returned to the OS). Dropping those
+   two columns -- neither used for display -- cut peak RSS to ~1.9GB. The size of that drop (~3.7GB
+   RSS for ~90MB of final column data) was disproportionate to a naive per-column estimate; it
+   came from the C engine's per-row tokenization overhead scaling with column *count* on a wide
+   file, not from the dropped columns' own data. Re-measure against the real file
+   (`resource.getrusage(...).ru_maxrss`, not `.memory_usage()`) before adding any column back.
+1b. Even with those columns gone, `load_bulk_pool()` itself still peaked at ~5.5GB, entirely from
+   one line: `df[df["record_id"].notna()].reset_index(drop=True)`, dropping the exactly-1 (of
+   744,647) real row with no pmcid/pmid/doi to compute an id from. Boolean-mask row selection on a
+   wide, object-dtype-heavy frame forces pandas to copy essentially the *entire* frame, even to
+   drop a single row -- same non-reclaimed-arena behavior as (1). Fixed by giving that one row a
+   synthetic placeholder id via a single-column `.loc[mask, "record_id"] = [...]` fill instead of
+   filtering it out -- a cheap, targeted write instead of a whole-frame copy. **The general lesson,
+   not just this one line: any `df[boolean_mask]`/`.dropna()`/similar row-selection on this
+   specific wide, text-heavy, ~745k-row frame is a potential multi-GB RSS spike regardless of how
+   few rows it actually drops -- prefer a single-column fix (fillna, `.loc[mask, col] = ...`) over
+   a whole-frame filter whenever the goal is only to patch a handful of bad values, and measure
+   with `resource.getrusage` before assuming a "small" filter is cheap.**
+2. This DataFrame and `bulk_scores.py`'s separately-cached ~2.07M-entry score lookup dict are both
+   `st.cache_resource`-cached and **both stay resident once built**, regardless of which Curate-page
+   queue source is currently selected -- a user who starts on the default "stratified queue" source
+   (which loads the dict) and then switches to "full bulk pool" (which loads the DataFrame) ends up
+   with both in memory simultaneously, in the same Streamlit process, for the rest of that process's
+   life. This is not a rare edge case; it's the direct, intended result of the queue-source toggle
+   existing at all. Budget for *both* being resident together when reasoning about this page's peak
+   memory, not just whichever one a single code path appears to touch.
+
+**The fixes above (1, 1b, 2) were not sufficient on their own** -- real use still hit `curate-1
+exited with code 137` (SIGKILL). Multi-step `AppTest` profiling (not a single call -- see below for
+why that matters) found two more compounding sources, both now fixed:
+3. `build_probe_session()` (used only to size the Filters widgets) was **deliberately uncached**,
+   on the reasoning that rebuilding it was cheap since `canonical_dataset.csv` is small. That
+   reasoning silently stopped being true the moment `queue_source="bulk_pool"` existed: probing the
+   bulk pool runs `_scored_pool()`'s full filter chain on *every single script rerun*, not just when
+   a filter actually changes, and each run's peak RSS isn't reclaimed. Fixed by giving
+   `build_probe_session()` its own `session_state`-based cache slot, same pattern as `get_session()`
+   (a separate slot, not the same one -- see that function's docstring for why they must stay
+   separate). `_scored_pool()`'s own masking chain was also collapsed from up to 6 sequential
+   `reviewable[mask]` copies down to 2 (one combined mask before the score/screening joins, one
+   after) -- each sequential filter is its own full-frame copy.
+4. `CurationSession.current_record()` -- called on *every single rerun*, cached session or not --
+   did `self.dataset.loc[self.dataset["record_id"] == record_id]`: a boolean-mask selection over
+   the full wide frame (title/abstract/mesh_headings included) just to fetch one row. Cost doesn't
+   scale with the (tiny) output, it scales with the frame's full width -- measured at ~1.1GB of
+   peak RSS on its first call, plus smaller-but-real, never-reclaimed amounts on every subsequent
+   Forward/Back click for the rest of the session. Fixed with a `.set_index("record_id")`-backed
+   lookup, memoized once per `CurationSession` instance (`_dataset_by_id()`) -- pays a comparable
+   one-time cost at session construction (now itself cached, per point 3) instead of repeating on
+   every click. Handle the case `.loc[record_id]` returns a DataFrame, not a Series: two bulk-pool
+   rows can legitimately share a computed `record_id` (see `bulk_pool.py`) when the source data
+   itself has near-duplicate pmcid/pmid/doi combinations -- take `.iloc[0]`, same as the old
+   boolean-mask code's `matches.iloc[0]`.
+
+**Net result**, measured via a realistic simulated session (initial load, switch to bulk pool, 8
+Forward clicks, a journal filter set then cleared, 5 more Forward clicks): peak RSS **4.19GB**
+(down from the 8.7GB kill), and steady-state Forward/Back clicks that used to keep climbing every
+time now stay **exactly flat** call to call -- and got ~3x faster in the process (0.28-0.36s vs
+0.45-0.85s) as a side effect of not re-copying the wide frame per click. **The general lesson across
+all four fixes**: on this specific ~745k-row, text-heavy frame, *any* full-frame operation --
+`usecols` width, `df[mask]`, `.assign()`, boolean-mask row lookup -- is a potential multi-GB RSS
+spike regardless of how small the logical change or output is, and none of that peak RSS is
+reclaimed afterward (glibc doesn't return freed heap arenas to the OS, so unreclaimed peaks are
+effectively permanent for the process's lifetime). Never assume a "small" operation on this frame
+is cheap; measure with `resource.getrusage(...).ru_maxrss` (not `.memory_usage()`, which only
+counts live data, not the operation's transient peak) via a **multi-step** `AppTest` run that
+simulates a real browsing session, not a single isolated call -- the worst costs in this whole
+incident were all compounding-across-reruns effects that a one-shot measurement would have missed
+entirely.
+
 ## Data provenance
 
 Two complementary mechanisms, both mandatory:

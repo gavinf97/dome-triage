@@ -607,3 +607,311 @@ def test_current_record_prior_decision_reflects_latest_this_session(tmp_path):
     session.record_decision("negative")  # overwrite while revisiting
     session.go_back()
     assert session.current_record_prior_decision() == "negative"
+
+
+# ---------------------------------------------------------------------------------------------
+# Bulk-pool browsing: dataset_df override, min_score/max_score, sort_by_score_desc -- the
+# mechanics behind the Curate page's "Full AI/ML bulk pool" queue source (curate/bulk_pool.py
+# builds the real dataset_df; these tests use a small in-memory frame with the same shape).
+# ---------------------------------------------------------------------------------------------
+def _write_bulk_pool_df():
+    return pd.DataFrame(
+        {
+            "record_id": ["poolA", "poolB", "poolC", "poolD"],
+            "title": ["Highest", "Second", "Third", "Lowest"],
+            "abstract": ["a.", "b.", "c.", "d."],
+            "journal": ["J1", "J1", "J2", "J2"],
+            "year": ["2020", "2021", "2022", "2023"],
+            "label": ["unlabeled", "unlabeled", "unlabeled", "unlabeled"],
+            "label_confidence": [None, None, None, None],
+            "pmcid": ["", "", "", ""],
+            "bulk_match_score": [300.0, 200.0, 100.0, 50.0],
+            "bulk_match_classification": ["positive", "positive", "negative", "negative"],
+        }
+    )
+
+
+def test_dataset_df_override_is_used_instead_of_reading_dataset_path(tmp_path):
+    # dataset_path points at a file that doesn't exist -- if __post_init__ tried to read it, this
+    # would raise. It must not: dataset_df takes priority.
+    session = CurationSession(
+        dataset_path=tmp_path / "does_not_exist.csv",
+        dataset_df=_write_bulk_pool_df(),
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+    )
+    assert session.total() == 4
+    assert session.current_record()["record_id"] == "poolA"
+
+
+def test_sort_by_score_desc_orders_queue_by_bulk_match_score_descending(tmp_path):
+    df = _write_bulk_pool_df().iloc[[3, 1, 0, 2]].reset_index(drop=True)  # shuffle on-disk order
+    session = CurationSession(
+        dataset_path=tmp_path / "unused.csv",
+        dataset_df=df,
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+        sort_by_score_desc=True,
+    )
+    assert session.queue == ["poolA", "poolB", "poolC", "poolD"]  # 300 -> 200 -> 100 -> 50
+
+
+def test_without_sort_by_score_desc_queue_keeps_dataframe_order(tmp_path):
+    df = _write_bulk_pool_df().iloc[[3, 1, 0, 2]].reset_index(drop=True)
+    session = CurationSession(
+        dataset_path=tmp_path / "unused.csv",
+        dataset_df=df,
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+    )
+    assert session.queue == ["poolD", "poolB", "poolA", "poolC"]
+
+
+def test_max_score_filter_excludes_records_scoring_above_it(tmp_path):
+    session = CurationSession(
+        dataset_path=tmp_path / "unused.csv",
+        dataset_df=_write_bulk_pool_df(),
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+        max_score=150.0,
+    )
+    assert set(session.queue) == {"poolC", "poolD"}
+
+
+def test_min_score_filter_excludes_records_scoring_below_it(tmp_path):
+    session = CurationSession(
+        dataset_path=tmp_path / "unused.csv",
+        dataset_df=_write_bulk_pool_df(),
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+        min_score=150.0,
+    )
+    assert set(session.queue) == {"poolA", "poolB"}
+
+
+def test_min_and_max_score_together_narrow_to_a_band(tmp_path):
+    session = CurationSession(
+        dataset_path=tmp_path / "unused.csv",
+        dataset_df=_write_bulk_pool_df(),
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+        min_score=75.0,
+        max_score=250.0,
+    )
+    assert set(session.queue) == {"poolB", "poolC"}
+
+
+def test_bulk_pool_session_decision_writes_event_with_bulk_pool_record_id(tmp_path):
+    # Confirms a decision made while browsing the bulk pool writes a real event -- the same event
+    # log any other session writes to -- keyed on the bulk-pool row's own record_id.
+    events_path = tmp_path / "events.csv"
+    session = CurationSession(
+        dataset_path=tmp_path / "unused.csv",
+        dataset_df=_write_bulk_pool_df(),
+        events_path=events_path,
+        curator="alice",
+        sort_by_score_desc=True,
+    )
+    session.record_decision("positive")
+
+    events = pd.read_csv(events_path)
+    assert events.iloc[0]["record_id"] == "poolA"
+    assert events.iloc[0]["decision"] == "positive"
+
+
+def test_current_record_uses_indexed_lookup_not_a_boolean_scan(tmp_path):
+    # current_record() used to do `self.dataset.loc[self.dataset["record_id"] == record_id]` -- a
+    # boolean-mask selection over the *full* wide frame. On the real ~745k-row bulk pool this
+    # measured ~1.1GB of peak RSS on its first call and kept adding smaller-but-real,
+    # never-reclaimed amounts on every subsequent click (see AGENTS.md's "Curate app performance"
+    # section). Fixed via a `.set_index("record_id")`-backed lookup, memoized per instance. This
+    # test can't reproduce the RSS difference on a tiny fixture, but pins the *correctness* of the
+    # indexed path, including the duplicate-record_id case a plain unique-index lookup would break
+    # on (two bulk-pool rows can legitimately share a record_id -- see bulk_pool.py).
+    df = _write_bulk_pool_df()
+    df.loc[len(df)] = df.loc[df["record_id"] == "poolB"].iloc[0]  # duplicate poolB's row
+    session = CurationSession(
+        dataset_path=tmp_path / "unused.csv",
+        dataset_df=df,
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+    )
+
+    record = session.current_record()
+    assert record["record_id"] == "poolA"
+
+    session.go_forward()
+    record = session.current_record()
+    assert record["record_id"] == "poolB"
+    assert record["title"] == "Second"
+
+
+def test_current_record_returns_none_for_a_record_id_not_in_the_dataset(tmp_path):
+    df = _write_bulk_pool_df()
+    session = CurationSession(
+        dataset_path=tmp_path / "unused.csv",
+        dataset_df=df,
+        events_path=tmp_path / "events.csv",
+        curator="alice",
+    )
+    session.queue = ["not-a-real-record-id"]
+    session._position = 0
+
+    assert session.current_record() is None
+
+
+# ---------------------------------------------------------------------------------------------
+# materialize_events: inserting a decision made on a record that isn't in canonical_dataset.csv
+# yet (reached by browsing the full bulk pool directly) -- the correctness-critical fix that
+# makes bulk-pool curation safe. Without it these decisions would hit `if not mask.any():
+# continue` and be silently discarded.
+# ---------------------------------------------------------------------------------------------
+def _write_bulk_pool_csv(path):
+    from dome_triage.dedupe.keys import record_id_from_ids
+
+    new_record_id = record_id_from_ids("PMC5000001", "", "")
+    pd.DataFrame(
+        {
+            "source_name": ["bulk_match_2024"],
+            "label": ["unlabeled"],
+            "label_confidence": ["unscored"],
+            "pmcid": ["PMC5000001"],
+            "pmid": [""],
+            "doi": [""],
+            "title": ["A brand new bulk-pool paper"],
+            "abstract": ["Applies a random forest to genomics data."],
+            "journal": ["Bulk Journal"],
+            "authors": ["Someone"],
+            "year": ["2024"],
+            "citation_count": ["0"],
+            "mesh_headings": ["[]"],
+            "pub_types": ['["Journal Article"]'],
+            "is_open_access": ["True"],
+            "keywords_author": ["[]"],
+            "fulltext_available": ["False"],
+        }
+    ).to_csv(path, index=False)
+    return path, new_record_id
+
+
+def _write_empty_canonical_dataset(path):
+    pd.DataFrame(
+        {
+            "record_id": ["rec1"],
+            "title": ["Existing paper"],
+            "abstract": ["Existing abstract."],
+            "label": ["unlabeled"],
+            "label_confidence": [None],
+            "has_conflict": [False],
+            "curation_tag": [None],
+            "notes": [None],
+            "updated_at": [None],
+        }
+    ).to_csv(path, index=False)
+    return path
+
+
+def test_materialize_events_inserts_a_new_row_for_a_bulk_pool_only_record(tmp_path):
+    dataset_path = _write_empty_canonical_dataset(tmp_path / "canonical_dataset.csv")
+    bulk_pool_path, new_record_id = _write_bulk_pool_csv(tmp_path / "bulk_candidates_scored.csv")
+    events_path = tmp_path / "curation_events.csv"
+    pd.DataFrame(
+        [
+            {
+                "record_id": new_record_id,
+                "decision": "positive",
+                "tag": "",
+                "notes": "found via bulk pool browsing",
+                "features": "",
+                "curator": "alice",
+                "timestamp": "2026-01-01T00:00:00+00:00",
+            }
+        ]
+    ).to_csv(events_path, index=False)
+
+    result = materialize_events(dataset_path, events_path, tmp_path / "out.csv", bulk_pool_path=bulk_pool_path)
+
+    assert len(result) == 2  # the original rec1, plus the newly-inserted record
+    new_row = result[result["record_id"] == new_record_id].iloc[0]
+    assert new_row["label"] == "positive"
+    assert new_row["label_confidence"] == "human_curated"
+    assert new_row["title"] == "A brand new bulk-pool paper"
+    assert new_row["notes"] == "found via bulk pool browsing"
+
+
+def test_materialize_events_new_row_record_id_matches_dedupe_pipeline(tmp_path):
+    # The inserted row's record_id must be reproducible by a real `dedupe consolidate` run over
+    # the same pmcid/pmid/doi later -- otherwise a subsequent Step 13 re-run could create a
+    # duplicate row for the same paper instead of recognizing it as already present.
+    from dome_triage.dedupe.keys import record_id_from_ids
+
+    dataset_path = _write_empty_canonical_dataset(tmp_path / "canonical_dataset.csv")
+    bulk_pool_path, new_record_id = _write_bulk_pool_csv(tmp_path / "bulk_candidates_scored.csv")
+    events_path = tmp_path / "curation_events.csv"
+    pd.DataFrame(
+        [
+            {
+                "record_id": new_record_id,
+                "decision": "negative",
+                "tag": "",
+                "notes": "",
+                "features": "",
+                "curator": "alice",
+                "timestamp": "2026-01-01T00:00:00+00:00",
+            }
+        ]
+    ).to_csv(events_path, index=False)
+
+    result = materialize_events(dataset_path, events_path, tmp_path / "out.csv", bulk_pool_path=bulk_pool_path)
+
+    assert new_record_id == record_id_from_ids("PMC5000001", "", "")
+    assert new_record_id in set(result["record_id"])
+
+
+def test_materialize_events_skips_gracefully_when_record_missing_from_both_dataset_and_bulk_pool(tmp_path, capsys):
+    dataset_path = _write_empty_canonical_dataset(tmp_path / "canonical_dataset.csv")
+    bulk_pool_path, _ = _write_bulk_pool_csv(tmp_path / "bulk_candidates_scored.csv")
+    events_path = tmp_path / "curation_events.csv"
+    pd.DataFrame(
+        [
+            {
+                "record_id": "totally-unknown-record-id",
+                "decision": "positive",
+                "tag": "",
+                "notes": "",
+                "features": "",
+                "curator": "alice",
+                "timestamp": "2026-01-01T00:00:00+00:00",
+            }
+        ]
+    ).to_csv(events_path, index=False)
+
+    result = materialize_events(dataset_path, events_path, tmp_path / "out.csv", bulk_pool_path=bulk_pool_path)
+
+    assert len(result) == 1  # unchanged -- nothing to insert, nothing crashed
+    assert "totally-unknown-record-id" not in set(result["record_id"])
+    assert "WARNING" in capsys.readouterr().out  # the decision loss is surfaced, not silent
+
+
+def test_materialize_events_without_bulk_pool_path_preserves_prior_silent_skip_behavior(tmp_path):
+    # Backward compatibility: existing callers that don't pass bulk_pool_path (the default None)
+    # must behave exactly as before this feature existed.
+    dataset_path = _write_empty_canonical_dataset(tmp_path / "canonical_dataset.csv")
+    events_path = tmp_path / "curation_events.csv"
+    pd.DataFrame(
+        [
+            {
+                "record_id": "some-record-not-in-dataset",
+                "decision": "positive",
+                "tag": "",
+                "notes": "",
+                "features": "",
+                "curator": "alice",
+                "timestamp": "2026-01-01T00:00:00+00:00",
+            }
+        ]
+    ).to_csv(events_path, index=False)
+
+    result = materialize_events(dataset_path, events_path, tmp_path / "out.csv")
+
+    assert len(result) == 1

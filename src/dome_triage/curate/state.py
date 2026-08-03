@@ -19,7 +19,10 @@ from typing import Optional
 import pandas as pd
 
 from dome_triage.curate.bulk_scores import annotate_bulk_scores, annotate_screening
+from dome_triage.dedupe.consolidate import to_dataframe
+from dome_triage.dedupe.keys import canonical_key_from_ids, record_id_from_ids
 from dome_triage.sampling.stratified import build_strata
+from dome_triage.schema import CanonicalRecord, SourceProvenance
 
 EVENT_COLUMNS = ["record_id", "decision", "tag", "notes", "features", "curator", "timestamp"]
 
@@ -47,6 +50,14 @@ class CurationSession:
     include_already_labeled: bool = False
     require_pmcid: bool = False
 
+    # Pre-built dataset override -- when given, __post_init__ uses this DataFrame directly instead
+    # of `pd.read_csv(dataset_path, dtype=str)`. `dataset_path` is still required and still shown
+    # for provenance (e.g. set to the bulk pool's own path), it just isn't re-read from disk. This
+    # is what lets a session browse `curate/bulk_pool.py::load_bulk_pool()`'s ~745k-row frame
+    # (built once, cached by the caller) instead of always reading canonical_dataset.csv -- see
+    # streamlit_helpers.py's `queue_source` param.
+    dataset_df: Optional[pd.DataFrame] = None
+
     # Optional lookups (see curate/bulk_scores.py) joining Step 12/14b's bulk-file-only columns
     # onto this session's rows for filtering/display -- canonical_dataset.csv itself never gains
     # these columns (see bulk_scores.py's module docstring for why). Built once by the caller
@@ -69,6 +80,21 @@ class CurationSession:
     n_score_bands: int = 4
     top_n_journals: int = 15
 
+    # Raw-score bounds -- distinct from `score_band` (which restricts to whole quartiles of
+    # *whatever population is currently filtered*). These are an absolute BM25 figure the curator
+    # picked directly (e.g. "show me everything scoring at most 250"), for browsing the full bulk
+    # pool ranked by score rather than being confined to Step 13's pre-stratified queue. Usable in
+    # either queue source, though only meaningful once a `bulk_match_score` column exists.
+    min_score: Optional[float] = None
+    max_score: Optional[float] = None
+    # When True, the queue is ordered by `bulk_match_score` descending (highest-confidence AI/ML
+    # match first) instead of the dataset's on-disk row order. Requires `bulk_match_score` to
+    # already be a native column of `dataset`/`dataset_df` at construction time (true for
+    # `bulk_pool.py::load_bulk_pool()`'s output; NOT guaranteed for canonical_dataset.csv, whose
+    # score column is only populated inside `_scored_pool()` after a lookup join -- so this flag
+    # is meaningful for bulk-pool sessions specifically).
+    sort_by_score_desc: bool = False
+
     dataset: pd.DataFrame = field(init=False, repr=False)
     events: pd.DataFrame = field(init=False, repr=False)
     queue: list = field(init=False, repr=False)
@@ -84,9 +110,13 @@ class CurationSession:
     # same result up to ~6 times in a single Curate-page rerun before this existed (see
     # _scored_pool()'s own docstring for the incident).
     _scored_pool_cache: Optional[pd.DataFrame] = field(init=False, default=None, repr=False)
+    # Memoizes _dataset_by_id() -- see that method's docstring for the incident this fixes.
+    _dataset_by_id_cache: Optional[pd.DataFrame] = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
-        self.dataset = pd.read_csv(self.dataset_path, dtype=str)
+        self.dataset = (
+            self.dataset_df if self.dataset_df is not None else pd.read_csv(self.dataset_path, dtype=str)
+        )
         self.events = (
             pd.read_csv(self.events_path, dtype=str)
             if Path(self.events_path).exists()
@@ -109,11 +139,49 @@ class CurationSession:
             reviewable = reviewable[(year_numeric >= lo) & (year_numeric <= hi)]
 
         self._reviewable_ids = set(reviewable["record_id"])
-        self.queue = [
-            rid for rid in self.dataset["record_id"] if rid in self._reviewable_ids and rid not in decided
-        ]
+
+        if self.sort_by_score_desc and "bulk_match_score" in self.dataset.columns:
+            # Sort via a throwaway 2-column frame (record_id + score), never `self.dataset.assign
+            # (...)` -- `.assign()` on the *full* wide frame copies every column, including
+            # `abstract` (the ~745k-row bulk pool's single biggest column, ~1.1GB of the ~1.4GB
+            # total). A real, measured incident: this ran on every `__post_init__` call (every
+            # rerun in bulk-pool mode, since `build_probe_session()` -- see streamlit_helpers.py
+            # -- rebuilds fresh each time), and each copy's peak RSS isn't reclaimed afterward
+            # (glibc doesn't return freed heap arenas to the OS) -- the compounding cost across a
+            # real browsing session, not any single call, is what eventually OOM-killed the
+            # container. See `_scored_pool()`'s own docstring for the same lesson applied there.
+            sort_frame = pd.DataFrame(
+                {
+                    "record_id": self.dataset["record_id"],
+                    "_score": pd.to_numeric(self.dataset["bulk_match_score"], errors="coerce"),
+                }
+            )
+            ordered_ids = sort_frame.sort_values("_score", ascending=False, na_position="last")["record_id"]
+        else:
+            ordered_ids = self.dataset["record_id"]
+
+        self.queue = [rid for rid in ordered_ids if rid in self._reviewable_ids and rid not in decided]
         self._position = 0
         self._frontier = 0
+
+    # Every column `_scored_pool()`'s own logic, `build_strata()`, `score_band_summary()`, and
+    # `year_bounds()` actually read -- deliberately excludes `title`/`abstract`/`mesh_headings`
+    # (and anything else display-only), which `current_record()` reads directly from
+    # `self.dataset` instead, never from this method's return value. See `_scored_pool()`'s
+    # docstring for why this projection exists.
+    _SCORED_POOL_COLUMNS = (
+        "record_id",
+        "journal",
+        "year",
+        "label",
+        "label_confidence",
+        "pmcid",
+        "pmid",
+        "doi",
+        "bulk_match_score",
+        "bulk_match_classification",
+        "needs_screening",
+    )
 
     def _scored_pool(self) -> pd.DataFrame:
         """Applies every filter *except* score_band/journals/year_range, and adds the score-band
@@ -123,30 +191,63 @@ class CurationSession:
         measured incident: before this cache existed, those three call sites each independently
         recomputed the same result (and `annotate_bulk_scores` was independently expensive too,
         see its own docstring), measured at ~6 full recomputations for a single Curate-page
-        rerun, directly responsible for a 40-58s per-decision reload."""
+        rerun, directly responsible for a 40-58s per-decision reload.
+
+        Works on a *slim projection* of `self.dataset` (`_SCORED_POOL_COLUMNS`), not the full
+        wide frame -- a second, related, real incident: on the ~745k-row bulk pool, every
+        `reviewable[mask]` boolean-filter step below forces pandas to copy the full row width
+        (title/abstract/mesh_headings included -- `abstract` alone is ~1.1GB of that frame's
+        ~1.4GB), and that peak RSS is not reclaimed afterward. Since none of this method's own
+        logic or any of its three callers ever reads a text column from its *return value*
+        (`current_record()` reads those directly from `self.dataset`, never from here), there was
+        never a reason to carry them through this filtering chain at all. Confirmed via
+        `resource.getrusage` against the real file: this took the OOM-killed combined-cache
+        scenario from ~8.7GB down further once combined with the other fixes in this area (see
+        AGENTS.md's "Curate app performance" section for the full incident writeup)."""
         if self._scored_pool_cache is not None:
             return self._scored_pool_cache
 
-        reviewable = self.dataset
+        # Every `reviewable[mask]` line is its own full-frame row-selection copy -- on the
+        # ~745k-row bulk pool, even the slim projection above, chaining N of them (one per active
+        # filter) means N separate peak-RSS spikes, each left un-reclaimed by glibc afterward (see
+        # `_scored_pool()`'s docstring and AGENTS.md's "Curate app performance" section). Combined
+        # into two AND-ed masks -- one before the score/screening joins add their columns, one
+        # after -- so this pays for at most 2 copies instead of up to 6, regardless of how many
+        # filters are actually active this call.
+        reviewable = self.dataset[[c for c in self._SCORED_POOL_COLUMNS if c in self.dataset.columns]]
+
+        pre_join_mask = pd.Series(True, index=reviewable.index)
         if not self.include_already_labeled:
-            trusted_mask = self.dataset["label_confidence"].isin(_TRUSTED_LABEL_CONFIDENCE) & self.dataset[
+            trusted_mask = reviewable["label_confidence"].isin(_TRUSTED_LABEL_CONFIDENCE) & reviewable[
                 "label"
             ].isin(["positive", "negative"])
-            reviewable = reviewable[~trusted_mask]
+            pre_join_mask &= ~trusted_mask
         if self.require_pmcid:
-            reviewable = reviewable[reviewable["pmcid"].notna() & (reviewable["pmcid"] != "")]
+            pre_join_mask &= reviewable["pmcid"].notna() & (reviewable["pmcid"] != "")
+        if not pre_join_mask.all():
+            reviewable = reviewable[pre_join_mask]
 
         if self.bulk_score_lookup:
             reviewable = annotate_bulk_scores(reviewable, self.bulk_score_lookup)
         if self.screening_lookup:
             reviewable = annotate_screening(reviewable, self.screening_lookup)
 
+        post_join_mask = pd.Series(True, index=reviewable.index)
         if self.classification is not None:
-            reviewable = reviewable[
-                reviewable.get("bulk_match_classification", pd.Series(dtype=str)).isin(self.classification)
-            ]
+            post_join_mask &= reviewable.get("bulk_match_classification", pd.Series(dtype=str)).isin(
+                self.classification
+            )
         if self.needs_screening_only:
-            reviewable = reviewable[reviewable.get("needs_screening", pd.Series(dtype=bool)).fillna(False)]
+            screening_col = reviewable.get("needs_screening", pd.Series(False, index=reviewable.index))
+            post_join_mask &= screening_col.fillna(False)
+        if self.min_score is not None or self.max_score is not None:
+            score_numeric = pd.to_numeric(reviewable.get("bulk_match_score"), errors="coerce")
+            if self.min_score is not None:
+                post_join_mask &= score_numeric >= self.min_score
+            if self.max_score is not None:
+                post_join_mask &= score_numeric <= self.max_score
+        if not post_join_mask.all():
+            reviewable = reviewable[post_join_mask]
 
         has_scores = "bulk_match_score" in reviewable.columns and reviewable["bulk_match_score"].notna().any()
         self._scored_pool_cache = build_strata(
@@ -275,12 +376,36 @@ class CurationSession:
         remaining = self.remaining()
         return {"total": total, "decided": total - remaining, "remaining": remaining}
 
+    def _dataset_by_id(self) -> pd.DataFrame:
+        """`self.dataset` indexed by `record_id` (hash-based `.loc[]` lookup), built once and
+        memoized on `_dataset_by_id_cache` -- `current_record()`'s only consumer. A real, measured
+        incident: the previous implementation, `self.dataset.loc[self.dataset["record_id"] ==
+        record_id]`, is a boolean-mask selection over the *full* wide frame (title/abstract/
+        mesh_headings included) -- on the ~745k-row bulk pool this cost ~1.1GB of peak RSS on its
+        first call and kept adding smaller-but-real, never-reclaimed amounts on every subsequent
+        Forward/Back click, because boolean-mask selection on an object-dtype-heavy frame doesn't
+        scale with the (tiny, usually 1-row) *output*, only with the frame's full width -- the
+        exact same class of bug already documented for `_scored_pool()` and the bulk-pool sort in
+        `__post_init__` (see AGENTS.md's "Curate app performance" section). `.set_index()` still
+        pays a real, comparable cost, but only *once* per session construction -- which is now
+        itself cached (`get_session()`/`build_probe_session()` in streamlit_helpers.py) -- instead
+        of repeating on every single click for the session's entire lifetime."""
+        if self._dataset_by_id_cache is None:
+            self._dataset_by_id_cache = self.dataset.set_index("record_id", drop=False)
+        return self._dataset_by_id_cache
+
     def current_record(self) -> Optional[pd.Series]:
         if self._position >= len(self.queue):
             return None
         record_id = self.queue[self._position]
-        matches = self.dataset.loc[self.dataset["record_id"] == record_id]
-        return matches.iloc[0] if not matches.empty else None
+        by_id = self._dataset_by_id()
+        if record_id not in by_id.index:
+            return None
+        match = by_id.loc[record_id]
+        # A non-unique index (two bulk-pool rows genuinely sharing a record_id -- see
+        # bulk_pool.py's docstring) makes `.loc[record_id]` return a DataFrame instead of a
+        # Series; take the first, same as the old boolean-mask code's `matches.iloc[0]`.
+        return match.iloc[0] if isinstance(match, pd.DataFrame) else match
 
     def current_record_prior_decision(self) -> Optional[str]:
         """The latest decision already recorded this session for the record currently on screen,
@@ -354,7 +479,156 @@ class CurationSession:
         self._frontier = max(self._frontier, self._position)
 
 
-def materialize_events(dataset_path: Path, events_path: Path, output_path: Path) -> pd.DataFrame:
+_BULK_POOL_INSERT_COLS = [
+    "source_name",
+    "label",
+    "label_confidence",
+    "pmcid",
+    "pmid",
+    "doi",
+    "title",
+    "abstract",
+    "journal",
+    "authors",
+    "year",
+    "citation_count",
+    "mesh_headings",
+    "pub_types",
+    "is_open_access",
+    "keywords_author",
+    "fulltext_available",
+]
+
+
+def _json_list_or_empty(value) -> list:
+    if not isinstance(value, str) or not value.strip():
+        return []
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _int_or_none(value) -> Optional[int]:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _str_or_none(value) -> Optional[str]:
+    """`pd.read_csv(..., dtype=str)` still represents a genuinely empty cell as float `nan`, not
+    `""` -- `dtype` only constrains *non-null* values. A plain `value or None` is NOT a safe guard
+    against that: `nan` is truthy in Python (`bool(float('nan'))` is `True`), so `nan or None`
+    evaluates to `nan`, not `None` -- a real bug caught by this module's own tests (pydantic
+    correctly rejected the resulting float where a CanonicalRecord field expects `Optional[str]`).
+    `pd.isna` is the only reliable way to catch this."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+def _insert_missing_records_from_bulk_pool(
+    dataset: pd.DataFrame, missing_record_ids: set, bulk_pool_path: Path
+) -> tuple[pd.DataFrame, set]:
+    """A decision can be recorded (via `CurationSession.record_decision`) against a record_id that
+    doesn't exist in `dataset` yet -- browsing the full bulk pool (Step 12's `bulk_candidates_
+    scored.csv`, see `curate/bulk_pool.py`) reaches records that were never sampled into
+    `canonical_dataset.csv` by Step 13. Without this, that decision would hit the `if not
+    mask.any(): continue` branch below and be **silently discarded** -- a direct violation of
+    AGENTS.md's "human curation is never bypassed" rule, and the reason this function exists.
+
+    Looks each missing record_id up in the bulk pool (recomputing the same
+    `dedupe.keys.record_id_from_ids` hash per row -- there's no `record_id` column on the raw bulk
+    file itself) and, for every one found, builds a real `CanonicalRecord` from that row via the
+    exact same construction `dedupe consolidate` would eventually produce for it (same
+    `canonical_key`/`record_id`, `label="unlabeled"`/`label_confidence=None` -- matching
+    `dedupe.conflicts.merge_label`'s convention for a fresh unlabeled cluster, not the raw
+    `"unscored"` string the bulk file happens to carry), then appends it to `dataset` via
+    `dedupe.consolidate.to_dataframe` (the same JSON-encoding used for every other canonical row,
+    not a hand-rolled second encoder). The caller's existing per-event loop then runs unchanged --
+    the newly-inserted row now has a real `label`/`label_confidence` for that loop's
+    conflict-detection logic to compare the event's decision against, exactly like any
+    already-existing row.
+
+    Returns `(dataset_with_inserts, still_missing)` -- `still_missing` is whatever's left of
+    `missing_record_ids` that wasn't found in the bulk pool either (e.g. it came from a queue
+    source outside both files, or the bulk pool file has since been regenerated with different
+    contents) so the caller can warn about it rather than fail silently a second way."""
+    bulk_pool_path = Path(bulk_pool_path)
+    if not missing_record_ids or not bulk_pool_path.exists():
+        return dataset, set(missing_record_ids)
+
+    usecols = [c for c in _BULK_POOL_INSERT_COLS if c in pd.read_csv(bulk_pool_path, nrows=0).columns]
+    # fillna("") immediately after reading -- `pd.read_csv(..., dtype=str)` still represents a
+    # genuinely empty cell as float `nan`, not `""` (dtype only constrains non-null values). Doing
+    # this once here, rather than guarding every downstream `value or None`/`if value:` check
+    # individually, is what makes those checks correct below (nan is truthy in Python -- an
+    # unguarded `nan or None` evaluates to `nan`, not `None`; see `_str_or_none`'s docstring for
+    # the real failure this caused before this fix).
+    bulk = pd.read_csv(bulk_pool_path, usecols=usecols, dtype=str).fillna("")
+    bulk["record_id"] = [
+        record_id_from_ids(pmcid, pmid, doi) for pmcid, pmid, doi in zip(bulk["pmcid"], bulk["pmid"], bulk["doi"])
+    ]
+    bulk = bulk[bulk["record_id"].isin(missing_record_ids)].drop_duplicates(subset="record_id", keep="first")
+    if bulk.empty:
+        return dataset, set(missing_record_ids)
+
+    now = datetime.now(timezone.utc).isoformat()
+    new_records = []
+    for _, row in bulk.iterrows():
+        pmcid, pmid, doi = _str_or_none(row.get("pmcid")), _str_or_none(row.get("pmid")), _str_or_none(row.get("doi"))
+        canonical_key = canonical_key_from_ids(pmcid, pmid, doi)
+        matched_on = ",".join(
+            field for field, value in (("pmcid", pmcid), ("doi", doi), ("pmid", pmid)) if value
+        )
+        new_records.append(
+            CanonicalRecord(
+                record_id=row["record_id"],
+                canonical_key=canonical_key,
+                pmcid=pmcid,
+                pmid=pmid,
+                doi=doi,
+                title=_str_or_none(row.get("title")),
+                abstract=_str_or_none(row.get("abstract")),
+                journal=_str_or_none(row.get("journal")),
+                authors=_str_or_none(row.get("authors")),
+                year=_int_or_none(row.get("year")),
+                citation_count=_int_or_none(row.get("citation_count")),
+                label="unlabeled",
+                label_confidence=None,
+                sources=[
+                    SourceProvenance(
+                        source_name=_str_or_none(row.get("source_name")) or "bulk_match",
+                        source_label=_str_or_none(row.get("label")) or "unlabeled",
+                        source_label_confidence=_str_or_none(row.get("label_confidence")) or "unscored",
+                        source_file=str(bulk_pool_path),
+                        matched_on=matched_on or None,
+                    )
+                ],
+                source_count=1,
+                has_conflict=False,
+                mesh_headings=_json_list_or_empty(row.get("mesh_headings")),
+                pub_types=_json_list_or_empty(row.get("pub_types")),
+                is_open_access=(row.get("is_open_access") == "True") if row.get("is_open_access") else None,
+                keywords_author=_json_list_or_empty(row.get("keywords_author")),
+                fulltext_available=row.get("fulltext_available") == "True",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    new_rows = to_dataframe(new_records)
+    combined = pd.concat([dataset, new_rows], ignore_index=True)
+    still_missing = missing_record_ids - set(bulk["record_id"])
+    return combined, still_missing
+
+
+def materialize_events(
+    dataset_path: Path, events_path: Path, output_path: Path, bulk_pool_path: Optional[Path] = None
+) -> pd.DataFrame:
     """Folds curation_events.csv into the canonical dataset (last decision per record_id wins),
     flagging -- never silently overwriting -- any contradiction with a prior human_curated or
     registry_confirmed label. See AGENTS.md's "human curation is never bypassed" rule.
@@ -366,7 +640,12 @@ def materialize_events(dataset_path: Path, events_path: Path, output_path: Path)
     forever even after a human reviewed it via the app, making `label_confidence` alone unable to
     answer "was this actually reviewed" -- this fixes that. Conflicted rows keep their prior
     confidence untouched (it's already trusted-tier by definition -- that's what made it a
-    conflict in the first place; there's nothing to upgrade)."""
+    conflict in the first place; there's nothing to upgrade).
+
+    `bulk_pool_path`, if given, recovers decisions made against a record_id that isn't in
+    `dataset_path` yet -- see `_insert_missing_records_from_bulk_pool` above for why this matters
+    (curating directly from the full bulk pool, not just Step 13's pre-sampled queue, reaches
+    records `canonical_dataset.csv` has never seen)."""
     dataset = pd.read_csv(dataset_path, dtype=str)
     events_path = Path(events_path)
     if not events_path.exists():
@@ -377,6 +656,23 @@ def materialize_events(dataset_path: Path, events_path: Path, output_path: Path)
         return dataset
 
     latest = events.sort_values("timestamp").groupby("record_id").last()
+
+    missing_ids = set(latest.index) - set(dataset["record_id"])
+    if missing_ids and bulk_pool_path is not None:
+        dataset, still_missing = _insert_missing_records_from_bulk_pool(dataset, missing_ids, bulk_pool_path)
+        for record_id in still_missing:
+            print(
+                f"materialize: WARNING -- record_id {record_id} has a decision in {events_path} but no "
+                f"matching row in {dataset_path} or {bulk_pool_path}; that decision is being skipped.",
+                flush=True,
+            )
+    elif missing_ids:
+        for record_id in missing_ids:
+            print(
+                f"materialize: WARNING -- record_id {record_id} has a decision in {events_path} but no "
+                f"matching row in {dataset_path} (no bulk_pool_path given to recover it); skipping.",
+                flush=True,
+            )
 
     for record_id, event in latest.iterrows():
         mask = dataset["record_id"] == record_id

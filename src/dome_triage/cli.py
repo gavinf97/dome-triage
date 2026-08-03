@@ -239,11 +239,15 @@ def curate_launch(
 @curate_app.command("materialize")
 def curate_materialize(config_dir: str = _CONFIG_DIR_OPTION) -> None:
     """Folds curation_events.csv into canonical_dataset.csv (last decision wins per record,
-    conflicts with a trusted prior label are flagged, never silently overwritten)."""
+    conflicts with a trusted prior label are flagged, never silently overwritten). `bulk_pool_path`
+    is passed so decisions made by browsing directly from the full bulk pool (Curate page's "Full
+    AI/ML bulk pool" queue source) -- reaching records never sampled into canonical_dataset.csv by
+    `sampling stratify` -- get inserted as new rows instead of silently dropped."""
     cfg = _load_config(config_dir)
     events_path = resolve_path(cfg.pipeline["curation"]["events_log"])
     dataset_path = cfg.path("canonical_dataset")
-    materialize_events(dataset_path, events_path, dataset_path)
+    bulk_pool_path = cfg.sampling_path("bulk_candidates_scored")
+    materialize_events(dataset_path, events_path, dataset_path, bulk_pool_path=bulk_pool_path)
     typer.echo(f"Materialized {events_path} into {dataset_path}")
 
 

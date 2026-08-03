@@ -4,7 +4,6 @@ conflict detection (dedupe/conflicts.py) rather than silently resolving disagree
 
 from __future__ import annotations
 
-import hashlib
 import json
 from datetime import datetime, timezone
 from typing import Optional, TypeVar
@@ -12,7 +11,12 @@ from typing import Optional, TypeVar
 import pandas as pd
 
 from dome_triage.dedupe.conflicts import merge_label
-from dome_triage.dedupe.keys import ID_FIELDS, build_clusters, choose_canonical_key
+from dome_triage.dedupe.keys import (
+    ID_FIELDS,
+    build_clusters,
+    choose_canonical_key,
+    record_id_from_canonical_key,
+)
 from dome_triage.schema import CanonicalRecord, RawRecord, SourceProvenance
 
 T = TypeVar("T")
@@ -41,7 +45,7 @@ def _union_list(values: list[list[str]]) -> list[str]:
 
 def _merge_cluster(cluster: list[RawRecord], id_priority: tuple[str, ...]) -> CanonicalRecord:
     canonical_key = choose_canonical_key(cluster, id_priority)
-    record_id = hashlib.sha1(canonical_key.encode()).hexdigest()
+    record_id = record_id_from_canonical_key(canonical_key)
 
     label, label_confidence = merge_label(cluster)
     now = datetime.now(timezone.utc).isoformat()

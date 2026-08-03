@@ -9,6 +9,9 @@ decide cluster membership.
 
 from __future__ import annotations
 
+import hashlib
+from typing import Optional
+
 from dome_triage.schema import RawRecord
 
 ID_FIELDS = ("pmcid", "doi", "pmid")
@@ -74,3 +77,46 @@ def choose_canonical_key(
             if value:
                 return f"{_KEY_PREFIX[field]}:{value}"
     raise ValueError("Cluster has no usable ID on any contributing record")
+
+
+def canonical_key_from_ids(
+    pmcid: Optional[str],
+    pmid: Optional[str],
+    doi: Optional[str],
+    priority: tuple[str, ...] = ("pmcid", "doi", "pmid"),
+) -> Optional[str]:
+    """Same priority-order key construction as `choose_canonical_key`, but from three raw scalar
+    ID values directly rather than a formed RawRecord cluster -- for callers that only have a
+    single record's ids on hand (e.g. a bulk-match candidate row that has never been through
+    `dedupe consolidate`) and need the *same* key a future consolidate run would produce for it.
+    Returns None (never raises) when none of the three ids is present -- a valid, expected
+    outcome for a standalone caller, unlike `choose_canonical_key`'s cluster context where every
+    record is guaranteed at least one id by construction (source_loaders routes id-less rows to
+    `unresolved` instead)."""
+    values = {"pmcid": pmcid, "doi": doi, "pmid": pmid}
+    for field in priority:
+        value = values[field]
+        if value:
+            return f"{_KEY_PREFIX[field]}:{value}"
+    return None
+
+
+def record_id_from_canonical_key(canonical_key: str) -> str:
+    """The one hash `consolidate.py`'s `_merge_cluster` and any other caller must use to turn a
+    canonical_key into the `record_id` stamped on a CanonicalRecord -- factored out here so a
+    caller building a record *outside* the consolidate pipeline (e.g. curating directly from the
+    bulk pool before it's been through `dedupe consolidate`) computes the exact same id a later
+    consolidate run would, letting the two reconcile without an explicit join."""
+    return hashlib.sha1(canonical_key.encode()).hexdigest()
+
+
+def record_id_from_ids(
+    pmcid: Optional[str],
+    pmid: Optional[str],
+    doi: Optional[str],
+    priority: tuple[str, ...] = ("pmcid", "doi", "pmid"),
+) -> Optional[str]:
+    """Convenience composition of the two functions above -- the single call most callers with
+    raw scalar ids actually want. Returns None when no id is present at all."""
+    canonical_key = canonical_key_from_ids(pmcid, pmid, doi, priority)
+    return record_id_from_canonical_key(canonical_key) if canonical_key else None

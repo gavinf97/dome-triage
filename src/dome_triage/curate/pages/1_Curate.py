@@ -20,6 +20,7 @@ import yaml
 from dome_triage.config import resolve_path
 from dome_triage.curate.streamlit_helpers import (
     build_probe_session,
+    get_bulk_pool_score_bounds,
     get_filter_options,
     get_session,
     get_youden_threshold,
@@ -31,6 +32,27 @@ st.title("Curate")
 if not st.session_state.get("curator_name"):
     st.warning("Set your curator name on the Home page first.")
     st.stop()
+
+# ---------------------------------------------------------------------------------------------
+# Queue source -- outside the Filters expander, always visible, since it changes what "Filters"
+# even means below (score band vs. a raw score figure). "Curation queue" is Step 13's
+# pre-stratified ~2-3k sample already merged into canonical_dataset.csv; "Full bulk pool" is the
+# entire ~745k-record Europe PMC AI/ML match (bulk_candidates_scored.csv), ranked by BM25 score --
+# not confined to whatever Step 13 happened to sample. A decision made from the bulk pool on a
+# record never seen by canonical_dataset.csv is still safe: `curate materialize` (Step 16) inserts
+# a new row for it rather than dropping the decision (see state.py's `_insert_missing_records_
+# from_bulk_pool`).
+# ---------------------------------------------------------------------------------------------
+queue_source_label = st.radio(
+    "Queue source",
+    options=["Curation queue (Step 13 stratified sample)", "Full AI/ML bulk pool (~745k, ranked by BM25)"],
+    horizontal=True,
+    help="The stratified queue is the diverse, size-capped sample Step 13 already drew and merged "
+    "into canonical_dataset.csv. The full bulk pool is every one of the ~745k Europe PMC records "
+    "the AI/ML search matched, ranked by BM25 score highest-first -- pick this to browse/curate "
+    "beyond the stratified sample, e.g. starting from a specific score figure downward.",
+)
+queue_source = "bulk_pool" if queue_source_label.startswith("Full AI/ML") else "canonical"
 
 # ---------------------------------------------------------------------------------------------
 # Filters -- collapsed by default so the paper under review stays the focus; state persists once
@@ -53,45 +75,103 @@ with st.expander("Filters", expanded=False):
     classification = st.multiselect(
         "BM25 classification (Step 12)", options=["positive", "negative"]
     )
-    needs_screening_only = st.checkbox(
-        "Only show clear-negative candidates flagged for extra scrutiny (Step 14b)",
-        value=False,
-        help="A 'clear negative' (fetched specifically for NOT mentioning AI/ML terms) that "
-        "still scored above the validated lexicon threshold -- worth a closer look before "
-        "trusting it as a genuine negative.",
-    )
+    if queue_source == "canonical":
+        needs_screening_only = st.checkbox(
+            "Only show clear-negative candidates flagged for extra scrutiny (Step 14b)",
+            value=False,
+            help="A 'clear negative' (fetched specifically for NOT mentioning AI/ML terms) that "
+            "still scored above the validated lexicon threshold -- worth a closer look before "
+            "trusting it as a genuine negative. Not applicable to the full bulk pool (Step 14b "
+            "only screens the clear-negative candidates, not the AI/ML-matched pool).",
+        )
+    else:
+        needs_screening_only = False
 
     # Probe session: same base filters as above, but never touches get_session()'s cache slot --
-    # only used to compute real score-range/curated-so-far numbers for the band widget's labels.
+    # only used to compute real score-range/curated-so-far numbers below, and the year slider's
+    # bounds. queue_source-aware -- see build_probe_session()'s docstring.
     probe = build_probe_session(
         include_already_labeled=include_already_labeled,
         require_pmcid=require_pmcid,
         classification=classification or None,
         needs_screening_only=needs_screening_only,
+        queue_source=queue_source,
     )
-    band_summary = probe.score_band_summary()
-    _n_bands = len(band_summary)
 
-    def _format_band(band_idx: int) -> str:
-        info = next((b for b in band_summary if b["band"] == band_idx), None)
-        if info is None:
-            return f"Q{band_idx + 1}"
-        extreme = " (lowest)" if band_idx == 0 else " (highest)" if band_idx == _n_bands - 1 else ""
-        return (
-            f"Q{band_idx + 1}{extreme}: BM25 {info['min_score']:.1f}-{info['max_score']:.1f} "
-            f"-- {info['confirmed']}/{info['total']} curated"
+    if queue_source == "canonical":
+        band_summary = probe.score_band_summary()
+        _n_bands = len(band_summary)
+
+        def _format_band(band_idx: int) -> str:
+            info = next((b for b in band_summary if b["band"] == band_idx), None)
+            if info is None:
+                return f"Q{band_idx + 1}"
+            extreme = " (lowest)" if band_idx == 0 else " (highest)" if band_idx == _n_bands - 1 else ""
+            return (
+                f"Q{band_idx + 1}{extreme}: BM25 {info['min_score']:.1f}-{info['max_score']:.1f} "
+                f"-- {info['confirmed']}/{info['total']} curated"
+            )
+
+        score_band = st.multiselect(
+            "Match-score band (BM25)",
+            options=[b["band"] for b in band_summary],
+            format_func=_format_band,
+            help="Quartiles of match_score__bm25 (Q1 = lowest scores, Q4 = highest), computed "
+            "fresh over whatever the other filters above currently leave in the queue -- not "
+            "replaying Step 13's original 745k-pool-wide bands, which would be less useful now "
+            "that the queue is already a small, pre-stratified subset. 'X/Y curated' = how many "
+            "of that band's records already have a confirmed decision, out of the band's total. "
+            "See STEPS_Progress.md's Step 13 section for exactly how these bands, the journal "
+            "bucketing, and the per-stratum random sampling were computed.",
         )
+        min_score = max_score = None
+    else:
+        # Full bulk pool: no quartile-band concept (§ROADMAP -- the whole point is not being
+        # confined to Step 13's bands) -- instead, a raw score figure to browse from, always
+        # ranked highest-to-lowest (CurationSession's sort_by_score_desc=True, set in
+        # streamlit_helpers._bulk_pool_session_kwargs), with the Youden threshold shown explicitly
+        # so it's clear where the validated bake-off found match quality starts to drop off.
+        score_band = None
+        _pool_bounds = get_bulk_pool_score_bounds()
+        _pool_min, _pool_max = _pool_bounds if _pool_bounds else (0.0, 1000.0)
+        _youden = get_youden_threshold()
 
-    score_band = st.multiselect(
-        "Match-score band (BM25)",
-        options=[b["band"] for b in band_summary],
-        format_func=_format_band,
-        help="Quartiles of match_score__bm25 (Q1 = lowest scores, Q4 = highest), computed fresh "
-        "over whatever the other filters above currently leave in the queue -- not replaying "
-        "Step 13's original 745k-pool-wide bands, which would be less useful now that the queue "
-        "is already a small, pre-stratified subset. 'X/Y curated' = how many of that band's "
-        "records already have a confirmed decision, out of the band's total.",
-    )
+        score_col1, score_col2 = st.columns(2)
+        max_score = score_col1.number_input(
+            "Start browsing at BM25 score ≤",
+            min_value=_pool_min,
+            max_value=_pool_max,
+            value=_pool_max,
+            step=1.0,
+            help=f"The full bulk pool's real score range is {_pool_min:.1f} to {_pool_max:.1f}. "
+            "Records are always shown highest-scoring first, so this is exactly where browsing "
+            "starts -- lower it to jump straight to a specific point in the ranking.",
+        )
+        min_score = score_col2.number_input(
+            "...down to BM25 score ≥",
+            min_value=_pool_min,
+            max_value=_pool_max,
+            value=_pool_min,
+            step=1.0,
+            help="Leave at the pool minimum to keep browsing all the way to the bottom of the "
+            "ranking; raise it to stop the queue above a floor.",
+        )
+        if min_score > max_score:
+            st.warning("Minimum score is above the maximum -- no records will match. Adjust one of the two.")
+        if _youden is not None:
+            in_range = min_score <= _youden <= max_score
+            st.caption(
+                f"**Validated Youden threshold: {_youden:.1f}** (Step 11's bake-off, bm25 + "
+                "exclusionary lexicon) -- Step 12 classified records scoring at or above this as "
+                "positive, below it as negative. This is where the lexicon match starts to look "
+                "unreliable in aggregate; it's a signpost for your own judgement, not a cutoff "
+                "enforced anywhere in this view."
+                + (
+                    ""
+                    if in_range
+                    else " (outside your current min/max range above -- widen the range to see it.)"
+                )
+            )
 
     _filter_options = get_filter_options()
     journals = st.multiselect(
@@ -103,13 +183,20 @@ with st.expander("Filters", expanded=False):
     # -- e.g. once you've filtered to classification=positive, the slider should only span years
     # actually present among positive-classified records, not the full corpus's range.
     _year_min, _year_max = probe.year_bounds() or (_filter_options["year_min"], _filter_options["year_max"])
-    year_range = st.slider(
-        "Year range (bounds reflect the filters above, not the whole dataset)",
-        min_value=_year_min,
-        max_value=_year_max,
-        value=(_year_min, _year_max),
-        help="Collapse both handles to the same year to pick a single year.",
-    )
+    if _year_min == _year_max:
+        # st.slider requires min_value < max_value strictly -- a real, reachable case once other
+        # filters (journal/classification/score range) narrow the population to a single year,
+        # not just a test-fixture artifact. Show the one year directly instead of a slider.
+        st.caption(f"Year: **{_year_min}** (only one year present in the current filter)")
+        year_range = (_year_min, _year_max)
+    else:
+        year_range = st.slider(
+            "Year range (bounds reflect the filters above, not the whole dataset)",
+            min_value=_year_min,
+            max_value=_year_max,
+            value=(_year_min, _year_max),
+            help="Collapse both handles to the same year to pick a single year.",
+        )
 
 session = get_session(
     include_already_labeled=include_already_labeled,
@@ -119,6 +206,9 @@ session = get_session(
     year_range=year_range if year_range != (_year_min, _year_max) else None,
     classification=classification or None,
     needs_screening_only=needs_screening_only,
+    queue_source=queue_source,
+    min_score=min_score,
+    max_score=max_score,
 )
 
 with st.sidebar.expander("Diversity tracker", expanded=False):
@@ -236,13 +326,22 @@ if isinstance(mesh_raw, str) and mesh_raw.strip() not in ("", "[]"):
     if mesh_list:
         st.markdown(f"**MeSH terms:** {', '.join(mesh_list)}")
 
-with st.container(height=300):
-    st.markdown(record.get("abstract") or "*(no abstract available)*", unsafe_allow_html=True)
+# No fixed-height scrollable container here -- the whole abstract must be visible at a glance for
+# fast curation, not require scrolling to read the end before deciding.
+st.markdown(record.get("abstract") or "*(no abstract available)*", unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------------------------
 # Decision -- P/N/U/S all submit immediately and advance (see module docstring for why there's no
 # separate staged-decision step). Notes/optional feature widgets are read at submit time via
 # their session_state keys, not through an st.form.
+#
+# Select-type features (currently just close_negative_reason) render as a row of small, numbered,
+# hoverable toggle buttons -- visually separated above the P/N/U/S row, not a dropdown -- so a
+# reason can be pre-picked (by click or a 1-9 keyboard shortcut) *before* deciding, without itself
+# submitting anything. Clicking a decision button (or its P/N/U/S key) is still the only thing
+# that calls record_decision(); a select toggle only ever writes to session_state. Numbering is
+# global across every select-type feature (not restarted per feature), so a future feature #2
+# never collides with feature #1's digit shortcuts -- capped at 9 keys, matching keyboards.
 # ---------------------------------------------------------------------------------------------
 _features_path = resolve_path("configs/curation_features.yaml")
 _features_config = (
@@ -252,21 +351,59 @@ _features_config = (
 )
 
 st.text_area("Notes (optional)", key="curate_notes")
+
+
+def _toggle_feature_option(state_key: str, option: str):
+    def _callback():
+        st.session_state[state_key] = "" if st.session_state.get(state_key) == option else option
+
+    return _callback
+
+
+_digit_shortcuts: dict[str, str] = {}  # "1".."9" -> exact button label, for the keyboard script below
+_next_digit = 1
 for feature in _features_config:
+    state_key = f"curate_feat_{feature['key']}"
     if feature["type"] == "bool":
-        st.checkbox(feature["label"], key=f"curate_feat_{feature['key']}")
-    elif feature["type"] == "select":
-        st.selectbox(feature["label"], [""] + feature["options"], key=f"curate_feat_{feature['key']}")
+        st.checkbox(feature["label"], key=state_key)
+        continue
+    if feature["type"] != "select":
+        continue
+
+    st.session_state.setdefault(state_key, "")
+    descriptions = feature.get("descriptions", {})
+    st.caption(feature["label"])
+    option_cols = st.columns(len(feature["options"]))
+    for i, option in enumerate(feature["options"]):
+        has_shortcut = _next_digit <= 9
+        label = f"{_next_digit}: {option}" if has_shortcut else option
+        option_cols[i].button(
+            label,
+            key=f"{state_key}_opt_{i}",
+            on_click=_toggle_feature_option(state_key, option),
+            type="primary" if st.session_state.get(state_key) == option else "secondary",
+            help=descriptions.get(option, option),
+            use_container_width=True,
+        )
+        if has_shortcut:
+            _digit_shortcuts[str(_next_digit)] = label
+            _next_digit += 1
 
 
 def _submit(decision: str):
     def _callback():
         features = {}
         for feature in _features_config:
-            value = st.session_state.get(f"curate_feat_{feature['key']}")
-            if value not in (None, "", False):
+            state_key = f"curate_feat_{feature['key']}"
+            value = st.session_state.get(state_key)
+            shown_when = feature.get("shown_when_decision")
+            # Only attach this feature's value to the decision it's actually scoped to (e.g.
+            # close_negative_reason declares shown_when_decision: negative) -- otherwise a reason
+            # selected before accidentally clicking Positive would attach to the wrong decision.
+            # A feature with no shown_when_decision is unscoped and always eligible, unchanged.
+            if value not in (None, "", False) and shown_when in (None, decision):
                 features[feature["key"]] = value
-            st.session_state[f"curate_feat_{feature['key']}"] = "" if feature["type"] == "select" else False
+            st.session_state[state_key] = "" if feature["type"] == "select" else False
         notes = st.session_state.get("curate_notes", "")
         session.record_decision(decision, notes=notes, features=features or None)
         st.session_state["curate_notes"] = ""
@@ -283,15 +420,18 @@ btn_col3.button("Undeterminable (U)", on_click=_submit("undeterminable"), use_co
 btn_col4.button("Skip (S)", on_click=_submit("skipped"), use_container_width=True)
 
 # ---------------------------------------------------------------------------------------------
-# Keyboard shortcuts: P/N/U/S trigger the matching button above by simulating a real click on its
-# underlying DOM element (this is the only way to drive a server-side on_click callback from
-# client-side JS -- there's no direct Python hook to bind to). Guarded on a flag stashed on
-# `window.parent` (the actual browser tab, not this component's own iframe) so the listener is
-# attached exactly once for the page's lifetime -- st.iframe re-runs this script on every
-# Streamlit rerun (i.e. after every decision), and without the guard each rerun would stack
-# another duplicate listener on the parent document, eventually firing one keypress N times.
-# Ignored entirely while focus is inside a text input/textarea (typing "n" in Notes must type a
-# letter, not submit "negative").
+# Keyboard shortcuts: P/N/U/S trigger the matching decision button, 1-9 toggle the matching
+# feature-option button (see above -- selecting one this way does NOT submit anything, exactly
+# like clicking it), all by simulating a real click on the underlying DOM element (this is the
+# only way to drive a server-side on_click callback from client-side JS -- there's no direct
+# Python hook to bind to). Guarded on a flag stashed on `window.parent` (the actual browser tab,
+# not this component's own iframe) so the listener is attached exactly once for the page's
+# lifetime -- st.iframe re-runs this script on every Streamlit rerun (i.e. after every decision or
+# feature toggle), and without the guard each rerun would stack another duplicate listener on the
+# parent document, eventually firing one keypress N times. Ignored entirely while focus is inside
+# a text input/textarea (typing "n" or "1" in Notes must type a character, not trigger a
+# shortcut). `_digit_shortcuts` is built in Python above from whatever `configs/curation_features.
+# yaml` currently declares -- extending it with a 6th (or 10th) option needs no JS change here.
 # ---------------------------------------------------------------------------------------------
 st.iframe(
     """
@@ -315,10 +455,12 @@ st.iframe(
             );
             if (isTyping) { return; }
 
-            const keyMap = {
+            const keyMap = Object.assign({
                 'p': 'Positive (P)', 'n': 'Negative (N)',
                 'u': 'Undeterminable (U)', 's': 'Skip (S)',
-            };
+            }, """
+    + json.dumps(_digit_shortcuts)
+    + """);
             const label = keyMap[e.key.toLowerCase()];
             if (!label) { return; }
             const btn = findButton(label);
