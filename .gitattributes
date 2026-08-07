@@ -1,0 +1,5 @@
+# Curation event log is an append-only log (CurationSession resolves the effective decision
+# per record_id via `events.sort_values("timestamp").groupby("record_id").last()`), so when two
+# machines each append new rows, a plain concatenation of both sides is always a valid merge --
+# no need for manual conflict resolution.
+data/processed/curation_events.csv merge=union

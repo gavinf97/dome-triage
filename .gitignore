@@ -1,6 +1,12 @@
 # Data (all pipeline data is gitignored; see AGENTS.md for provenance/reproduction policy)
-data/
+data/*
 !data/.gitkeep
+
+# Curation event log is the one exception: tracked in git so curated decisions made on
+# separate machines can be pushed/pulled and merged (union merge driver, see .gitattributes).
+!data/processed/
+data/processed/*
+!data/processed/curation_events.csv
 
 # PDFs / large binaries never committed, except the tiny placeholder fixtures the loader tests
 # depend on (tests/fixtures/pdf_directory_gold_sample*/**).
