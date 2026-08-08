@@ -61,6 +61,20 @@ ML/AI is part of **how the study was done**, not just something it mentions.
 
 ### Your notes & examples (add as you go)
 <!-- e.g. 2026-08-05, PMID 12345678: borderline case, decided positive because Y -->
+# QSAR models - yes include if explicit ML, ensure year, etc. clear - older may not be
+# Include logistic regression multivariate - not stats
+# Include retrospective study is doing actual ml modelling e.g. training with datasets - exclude if not and only running (DOME not applicable and not original modelling)
+# UPDATE NOTES: Generic nlp negatves or stats method also
+# ML and stats compared pos as ML methods involved and compared
+# chemistry and anything in EPMC as life science journals will generally be in scope if genuine ML methods applied
+# In scope for pos: ML methods platforms where test train etc and does modelling
+# Meta analysis - not if not new methods, dataset use and re implementations - just looking at paper resultsa and maybe running one or two unreasanable as already existing lietrature scraped from should be the inclsuionary point 
+# another systematic review - maybe neg filter out
+#  Gaussian Process Anomaly Detection
+# PURE robotics - no, but if algorithms and ML yes
+# connectome-based predictive modeling (CPM) - ML
+# no for Bayesian decision analysis (BDA) - probablistic model vs ml
+# LLM yes - it is an ai/ml model, those that are trained strong yes. Those where sued
 
 ---
 
